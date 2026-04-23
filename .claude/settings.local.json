@@ -5,7 +5,9 @@
       "Bash(python3 --version)",
       "Bash(py --version)",
       "Bash(conda run *)",
-      "Bash(py -c ' *)"
+      "Bash(py -c ' *)",
+      "Bash(python3 -c ' *)",
+      "Bash(py prepare_ampds_enriched.py)"
     ]
   }
 }
