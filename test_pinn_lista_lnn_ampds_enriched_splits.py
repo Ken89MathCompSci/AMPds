@@ -346,11 +346,15 @@ def train_pinn_lista_model(data_dict, save_dir,
         Y_te[:, i:i+1] = ys.transform(Y_te[:, i:i+1])
         y_scalers.append(ys)
 
-    thresholds_scaled = [
-        (THRESHOLDS[app] - float(y_scalers[i].data_min_[0]))
-        / float(y_scalers[i].data_range_[0])
-        for i, app in enumerate(APPLIANCES)
-    ]
+    thresholds_scaled = []
+    for i, app in enumerate(APPLIANCES):
+        r = float(y_scalers[i].data_range_[0])
+        if r == 0.0:
+            thresholds_scaled.append(float('inf'))  # all-zero appliance; BCE always off
+        else:
+            thresholds_scaled.append(
+                (THRESHOLDS[app] - float(y_scalers[i].data_min_[0])) / r
+            )
 
     print(f"Train: {X_tr.shape} -> {Y_tr.shape}")
     print(f"Val:   {X_va.shape} -> {Y_va.shape}")
