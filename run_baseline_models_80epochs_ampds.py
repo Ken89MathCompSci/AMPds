@@ -57,14 +57,14 @@ BATCH     = 32
 WIN       = 100
 STRIDE    = 5
 
-APPLIANCES  = ['dish washer', 'fridge', 'oven', 'washer dryer']
-APP_LABELS  = ['Dish Washer', 'Fridge', 'Oven', 'Washer Dryer']
+APPLIANCES  = ['dish washer', 'fridge', 'basement', 'heat pump']
+APP_LABELS  = ['Dish Washer', 'Fridge', 'Basement', 'Heat Pump']
 
 THRESHOLDS = {
     'dish washer':  10.0,
     'fridge':       10.0,
-    'oven':         10.0,
-    'washer dryer': 10.0,
+    'basement':         10.0,
+    'heat pump': 10.0,
 }
 
 MODEL_LABELS = {

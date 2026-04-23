@@ -65,27 +65,27 @@ WARMUP_EPOCHS = 20
 
 DATA_DIR = 'data/AMPds_enriched_data'
 
-APPLIANCES = ['dish washer', 'fridge', 'oven', 'washer dryer']
+APPLIANCES = ['dish washer', 'fridge', 'basement', 'heat pump']
 
 THRESHOLDS = {
     'dish washer':  10.0,
     'fridge':       10.0,
-    'oven':         10.0,
-    'washer dryer': 10.0,
+    'basement':         10.0,
+    'heat pump': 10.0,
 }
 
 BCE_LAMBDA = {
     'dish washer':  0.3,
     'fridge':       0.3,
-    'oven':         0.3,
-    'washer dryer': 0.5,
+    'basement':         0.3,
+    'heat pump': 0.5,
 }
 
 BCE_ALPHA = {
     'dish washer':  1.5,
     'fridge':       1.5,
-    'oven':         4.0,
-    'washer dryer': 5.0,
+    'basement':         4.0,
+    'heat pump': 5.0,
 }
 
 

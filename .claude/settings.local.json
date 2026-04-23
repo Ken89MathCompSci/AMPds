@@ -7,7 +7,12 @@
       "Bash(conda run *)",
       "Bash(py -c ' *)",
       "Bash(python3 -c ' *)",
-      "Bash(py prepare_ampds_enriched.py)"
+      "Bash(py prepare_ampds_enriched.py)",
+      "Bash(where conda *)",
+      "Read(//c/Users/MathK/AppData/Local/Programs/Python//**)",
+      "Bash(/c/Users/MathK/AppData/Local/Programs/Python/Python313/python.exe --version)",
+      "Bash(/c/Users/MathK/AppData/Local/Programs/Python/Python313/python.exe -)",
+      "Bash(/c/Users/MathK/AppData/Local/Programs/Python/Python313/python.exe prepare_ampds_enriched.py)"
     ]
   }
 }

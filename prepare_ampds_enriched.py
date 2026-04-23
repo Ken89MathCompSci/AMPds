@@ -6,15 +6,15 @@ Each pkl stores a single-element tuple (df,) where df has columns:
   main_Q      - mains reactive power (VAR)
   dish washer - DWE active power    (W)
   fridge      - FGE active power    (W)
-  oven        - WOE active power    (W)
-  washer dryer- CWE active power    (W)
+  basement    - BME active power    (W)
+  heat pump   - HPE active power    (W)
 
 Meter mapping:
   meter1  = WHE  mains
-  meter6  = CWE  clothes washer  -> "washer dryer"
+  meter4  = BME  basement misc   -> "basement"
   meter8  = DWE  dishwasher      -> "dish washer"
   meter11 = FGE  fridge          -> "fridge"
-  meter21 = WOE  wall oven       -> "oven"
+  meter14 = HPE  heat pump       -> "heat pump"
 
 Splits (1-min resolution, same as data/AMPds/):
   train : 2013-11-21
@@ -38,12 +38,12 @@ COL_P = 5   # power, active (W)
 COL_Q = 7   # power, reactive (VAR)
 
 METER_MAP = {
-    'main':         (1,  COL_P),
-    'main_Q':       (1,  COL_Q),
-    'dish washer':  (8,  COL_P),
-    'fridge':       (11, COL_P),
-    'oven':         (21, COL_P),
-    'washer dryer': (6,  COL_P),
+    'main':       (1,  COL_P),
+    'main_Q':     (1,  COL_Q),
+    'dish washer':(8,  COL_P),
+    'fridge':     (11, COL_P),
+    'basement':   (4,  COL_P),
+    'heat pump':  (14, COL_P),
 }
 
 SPLITS = {

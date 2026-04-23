@@ -62,28 +62,28 @@ WIN           = 100
 STRIDE        = 5
 WARMUP_EPOCHS = 15
 
-APPLIANCES = ['dish washer', 'fridge', 'oven', 'washer dryer']
-APP_LABELS = ['Dish Washer', 'Fridge', 'Oven', 'Washer Dryer']
+APPLIANCES = ['dish washer', 'fridge', 'basement', 'heat pump']
+APP_LABELS = ['Dish Washer', 'Fridge', 'Basement', 'Heat Pump']
 
 THRESHOLDS = {
     'dish washer':  10.0,
     'fridge':       10.0,
-    'oven':         10.0,
-    'washer dryer': 10.0,
+    'basement':         10.0,
+    'heat pump': 10.0,
 }
 
 BCE_LAMBDA = {
     'dish washer':  0.3,
     'fridge':       0.3,
-    'oven':         0.3,
-    'washer dryer': 0.5,
+    'basement':         0.3,
+    'heat pump': 0.5,
 }
 
 BCE_ALPHA = {
     'dish washer':  1.5,
     'fridge':       1.5,
-    'oven':         4.0,
-    'washer dryer': 5.0,
+    'basement':         4.0,
+    'heat pump': 5.0,
 }
 
 SAVE_DIR = os.path.join('results', 'lnn_basic_ampds')

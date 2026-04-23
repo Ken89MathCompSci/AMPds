@@ -369,7 +369,7 @@ def test_on_all_appliances(window_size=100, hidden_size=64, dt=0.1,
     base_save_dir = f"models/conductance_lnn_ampds_specific_test_{timestamp}"
 
     all_results = {}
-    appliances = ['dish washer', 'fridge', 'oven', 'washer dryer']
+    appliances = ['dish washer', 'fridge', 'basement', 'heat pump']
 
     for appliance_name in appliances:
         print(f"\n{'='*60}")

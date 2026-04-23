@@ -68,7 +68,7 @@ class ConductanceLTCModel(nn.Module):
 INPUT_SIZE = 2       # main (W)  +  main_Q (VAR)
 DATA_DIR   = 'data/AMPds_enriched_data'
 
-APPLIANCES = ['dish washer', 'fridge', 'oven', 'washer dryer']
+APPLIANCES = ['dish washer', 'fridge', 'basement', 'heat pump']
 
 
 # ── Dataset ────────────────────────────────────────────────────────────────────

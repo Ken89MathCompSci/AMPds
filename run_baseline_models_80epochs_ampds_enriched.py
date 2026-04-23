@@ -65,14 +65,14 @@ INPUT_SIZE = 2          # main (W) + main_Q (VAR)
 DATA_DIR = 'data/AMPds_enriched_data'
 SAVE_DIR = os.path.join('results', 'baseline_80epochs_ampds_enriched')
 
-APPLIANCES  = ['dish washer', 'fridge', 'oven', 'washer dryer']
-APP_LABELS  = ['Dish Washer', 'Fridge', 'Oven', 'Washer Dryer']
+APPLIANCES  = ['dish washer', 'fridge', 'basement', 'heat pump']
+APP_LABELS  = ['Dish Washer', 'Fridge', 'Basement', 'Heat Pump']
 
 THRESHOLDS = {
     'dish washer':  10.0,
     'fridge':       10.0,
-    'oven':         10.0,
-    'washer dryer': 10.0,
+    'basement':         10.0,
+    'heat pump': 10.0,
 }
 
 MODEL_LABELS = {
