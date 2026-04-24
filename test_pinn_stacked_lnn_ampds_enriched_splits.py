@@ -1,21 +1,19 @@
 """
-Physics-Informed LTC LNN (PINN-LTC) for NILM -- AMPds enriched splits (P + Q).
+Physics-Informed Stacked LNN (PINN-StackedLNN) for NILM -- AMPds enriched splits (P + Q).
 
-Same as test_pinn_basic_lnn_ampds_enriched_splits.py except the cell uses
-input-dependent tau (full Liquid Time-Constant network) instead of a fixed
-learned scalar.
-
-  Fixed tau (basic):      tau   = softplus(tau_param)        -- constant after training
-  Input-dependent tau:    tau_t = softplus(W_tau · x_t + b)  -- recomputed every step
-
-This lets the cell self-regulate its memory timescale based on the current
-signal: fast tau on transients (device switching), slow tau on steady-state
-hold periods.
+Extends test_pinn_basic_lnn_ampds_enriched_splits.py by stacking N_LAYERS LTC
+cells. Lower layers track fast transients; higher layers capture slower duty-cycle
+dynamics. The hidden state of layer l feeds into layer l+1 at every timestep.
 
 Architecture:
     Input (batch, WIN, 2)  -- scaled [P, Q] mains window
          |
-    LTC cell (input-dependent tau)
+    LTC cell layer 1  (input_size -> hidden_size)
+         |
+    Dropout
+    LTC cell layer 2  (hidden_size -> hidden_size)
+         |
+    [Dropout + LTC cell layer 3 ...]
          |
     LayerNorm(hidden)
          |
@@ -24,12 +22,15 @@ Architecture:
     +----+----+----+----+
     output: (batch, 4)
 
+Each LTC cell:
+    tau   = softplus(tau_param)                 -- fixed learned timescale
+    f_t   = tanh( LayerNorm(W_in·x_t + W_rec·h) )
+    dh    = (−h/tau  +  f_t) · dt
+    h_new = clamp(h + dh, −10, 10)
+
 Loss:
     Stage 1 (epochs 1-WARMUP_EPOCHS): MSE only
     Stage 2 (remaining epochs):       MSE + lambda * L_phys + weighted BCE
-
-Physics constraint (active-power only, channel 0):
-    ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon) = 0
 """
 
 import sys
@@ -60,10 +61,12 @@ BATCH         = 32
 WIN           = 100
 STRIDE        = 5
 INPUT_SIZE    = 2        # main (W)  +  main_Q (VAR)
+N_LAYERS      = 2        # number of stacked LTC cells
 
 LAMBDA_PHYS   = 0.01
 EPSILON_W     = 50.0
 WARMUP_EPOCHS = 20
+DROPOUT       = 0.1
 
 DATA_DIR = 'data/AMPds_enriched_data'
 
@@ -96,13 +99,6 @@ BCE_ALPHA = {
 # ---------------------------------------------------------------------------
 
 class PhysicsConsistencyLoss(nn.Module):
-    """
-    Soft one-sided penalty:  ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon)
-
-    x_mid_scaled comes from channel 0 (active power P).
-    x_scaler_P is the MinMaxScaler fitted on the P channel.
-    """
-
     def __init__(self, x_scaler_P, y_scalers, appliances, epsilon_w=EPSILON_W):
         super().__init__()
         self.epsilon = epsilon_w
@@ -118,44 +114,70 @@ class PhysicsConsistencyLoss(nn.Module):
         self.register_buffer('y_ranges', torch.tensor(y_ranges, dtype=torch.float32))
 
     def forward(self, x_mid_scaled, pred_scaled):
-        x_raw     = x_mid_scaled * self.x_range + self.x_min   # (batch,)
-        p_raw     = pred_scaled  * self.y_ranges + self.y_mins  # (batch, n_apps)
+        x_raw     = x_mid_scaled * self.x_range + self.x_min
+        p_raw     = pred_scaled  * self.y_ranges + self.y_mins
         p_sum     = p_raw.sum(dim=1)
         violation = F.relu(p_sum - x_raw - self.epsilon)
         return violation.mean()
 
 
 # ---------------------------------------------------------------------------
-# LTC LNN Model (input-dependent tau)
+# Single LTC cell (fixed tau)
 # ---------------------------------------------------------------------------
 
-class PhysicsInformedLTCLiquidNetworkModel(nn.Module):
-    """
-    LTC cell with input-dependent tau -> per-appliance linear heads.
-
-    Cell update:
-        tau_t     = softplus(W_tau · x_t + b_tau)   -- recomputed every step
-        f_t       = tanh(LayerNorm(W_in·x_t + W_rec·h))
-        dh        = (-h / tau_t + f_t) * dt
-        h_new     = clamp(h + dh, -10, 10)
-
-    Compared to BasicLNN, the only change is that tau_t is a learned linear
-    function of the current input x_t rather than a fixed parameter vector.
-    """
-
-    def __init__(self, input_size, hidden_size, n_appliances, dt=0.1):
+class LTCCell(nn.Module):
+    def __init__(self, input_size, hidden_size, dt=0.1):
         super().__init__()
-        self.hidden_size  = hidden_size
-        self.n_appliances = n_appliances
-        self.dt           = dt
+        self.hidden_size = hidden_size
+        self.dt          = dt
 
         self.input_proj  = nn.Linear(input_size, hidden_size)
-        self.W_tau       = nn.Linear(input_size, hidden_size)   # input-dependent tau
+        self.tau         = nn.Parameter(torch.ones(hidden_size))
         self.rec_weights = nn.Parameter(torch.empty(hidden_size, hidden_size))
         nn.init.xavier_uniform_(self.rec_weights)
+        self.intra_norm  = nn.LayerNorm(hidden_size)
 
-        self.intra_norm = nn.LayerNorm(hidden_size)
-        self.norm       = nn.LayerNorm(hidden_size)
+    def forward(self, x_t, h):
+        """
+        x_t : (batch, input_size)
+        h   : (batch, hidden_size)
+        returns h_new : (batch, hidden_size)
+        """
+        tau        = F.softplus(self.tau).unsqueeze(0)          # (1, hidden)
+        input_proj = self.input_proj(x_t)
+        rec_proj   = torch.matmul(h, self.rec_weights)
+        f_t        = torch.tanh(self.intra_norm(input_proj + rec_proj))
+        dh         = (-h / tau + f_t) * self.dt
+        return (h + dh).clamp(-10.0, 10.0)
+
+
+# ---------------------------------------------------------------------------
+# Stacked LNN Model
+# ---------------------------------------------------------------------------
+
+class PhysicsInformedStackedLiquidNetworkModel(nn.Module):
+    """
+    N stacked LTC cells. At each timestep the output (hidden state) of cell l
+    is the input to cell l+1. The final hidden state of the top cell feeds the
+    per-appliance output heads.
+
+    Dropout is applied between layers (not inside the cell recurrence).
+    """
+
+    def __init__(self, input_size, hidden_size, n_layers, n_appliances,
+                 dt=0.1, dropout=DROPOUT):
+        super().__init__()
+        self.hidden_size  = hidden_size
+        self.n_layers     = n_layers
+        self.n_appliances = n_appliances
+
+        cells = []
+        for i in range(n_layers):
+            in_sz = input_size if i == 0 else hidden_size
+            cells.append(LTCCell(in_sz, hidden_size, dt))
+        self.cells   = nn.ModuleList(cells)
+        self.dropout = nn.Dropout(p=dropout)
+        self.norm    = nn.LayerNorm(hidden_size)
 
         self.heads = nn.ModuleList([
             nn.Linear(hidden_size, 1) for _ in range(n_appliances)
@@ -164,19 +186,17 @@ class PhysicsInformedLTCLiquidNetworkModel(nn.Module):
     def forward(self, x):
         """x: (batch, seq_len, input_size)"""
         batch_size, seq_len, _ = x.size()
-        h = torch.zeros(batch_size, self.hidden_size, device=x.device)
+        h = [torch.zeros(batch_size, self.hidden_size, device=x.device)
+             for _ in range(self.n_layers)]
 
         for t in range(seq_len):
-            x_t        = x[:, t, :]
-            tau_t      = F.softplus(self.W_tau(x_t))           # (batch, hidden)
-            input_proj = self.input_proj(x_t)
-            rec_proj   = torch.matmul(h, self.rec_weights)
-            f_t        = torch.tanh(self.intra_norm(input_proj + rec_proj))
-            dh         = (-h / tau_t + f_t) * self.dt
-            h          = (h + dh).clamp(-10.0, 10.0)
+            layer_input = x[:, t, :]
+            for l, cell in enumerate(self.cells):
+                h[l] = cell(layer_input, h[l])
+                layer_input = self.dropout(h[l]) if l < self.n_layers - 1 else h[l]
 
-        h = self.norm(h)
-        return torch.cat([head(h) for head in self.heads], dim=1)
+        out = self.norm(h[-1])
+        return torch.cat([head(out) for head in self.heads], dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -213,28 +233,24 @@ def load_data():
 
 
 def create_sequences(data, window_size=WIN):
-    """Two-channel input [P, Q]; midpoint targeting for appliance labels."""
     mains = np.stack(
         [data['main'].values, data['main_Q'].values], axis=-1
-    ).astype(np.float32)                                    # (T, 2)
+    ).astype(np.float32)
     app_vals = {app: data[app].values for app in APPLIANCES}
     X, Y = [], []
     for i in range(0, len(mains) - window_size, STRIDE):
-        X.append(mains[i:i + window_size])                  # (WIN, 2)
+        X.append(mains[i:i + window_size])
         mid = i + window_size // 2
         Y.append([app_vals[app][mid] for app in APPLIANCES])
     return (
-        np.array(X, dtype=np.float32),                      # (N, WIN, 2)
-        np.array(Y, dtype=np.float32),                      # (N, 4)
+        np.array(X, dtype=np.float32),
+        np.array(Y, dtype=np.float32),
     )
 
 
 def _scale_X(X_tr, X_va, X_te):
-    """Per-channel MinMaxScaler on train; returns scaled arrays + list of scalers."""
     n_tr, n_va, n_te = X_tr.shape[0], X_va.shape[0], X_te.shape[0]
-    X_tr_n = X_tr.copy()
-    X_va_n = X_va.copy()
-    X_te_n = X_te.copy()
+    X_tr_n, X_va_n, X_te_n = X_tr.copy(), X_va.copy(), X_te.copy()
     scalers = []
     for ch in range(INPUT_SIZE):
         sc = MinMaxScaler()
@@ -255,10 +271,8 @@ def _scale_X(X_tr, X_va, X_te):
 def compute_per_appliance_metrics(y_true, y_pred, y_scalers):
     metrics = {}
     for i, app in enumerate(APPLIANCES):
-        raw_true = y_scalers[i].inverse_transform(
-            y_true[:, i:i+1]).flatten()
-        raw_pred = y_scalers[i].inverse_transform(
-            y_pred[:, i:i+1]).flatten()
+        raw_true = y_scalers[i].inverse_transform(y_true[:, i:i+1]).flatten()
+        raw_pred = y_scalers[i].inverse_transform(y_pred[:, i:i+1]).flatten()
         metrics[app] = calculate_nilm_metrics(
             raw_true, raw_pred, threshold=THRESHOLDS[app])
     return metrics
@@ -269,22 +283,21 @@ def compute_per_appliance_metrics(y_true, y_pred, y_scalers):
 # ---------------------------------------------------------------------------
 
 def train_pinn_model(data_dict, save_dir,
-                     hidden_size=64, dt=0.1,
-                     lambda_phys=LAMBDA_PHYS, epsilon_w=EPSILON_W):
+                     hidden_size=64, n_layers=N_LAYERS, dt=0.1,
+                     lambda_phys=LAMBDA_PHYS, epsilon_w=EPSILON_W,
+                     dropout=DROPOUT):
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"lambda_phys={lambda_phys}  epsilon={epsilon_w} W  hidden={hidden_size}  dt={dt}")
+    print(f"lambda_phys={lambda_phys}  epsilon={epsilon_w} W  "
+          f"hidden={hidden_size}  n_layers={n_layers}  dt={dt}  dropout={dropout}")
 
-    # ── Sequences ──
     X_tr, Y_tr = create_sequences(data_dict['train'], WIN)
     X_va, Y_va = create_sequences(data_dict['val'],   WIN)
     X_te, Y_te = create_sequences(data_dict['test'],  WIN)
 
-    # ── Scale X per channel; keep x_scalers[0] for physics loss (P channel) ──
     X_tr, X_va, X_te, x_scalers = _scale_X(X_tr, X_va, X_te)
 
-    # ── Scale Y per appliance ──
     y_scalers = []
     for i in range(len(APPLIANCES)):
         ys = MinMaxScaler()
@@ -297,7 +310,7 @@ def train_pinn_model(data_dict, save_dir,
     for i, app in enumerate(APPLIANCES):
         r = float(y_scalers[i].data_range_[0])
         if r == 0.0:
-            thresholds_scaled.append(float('inf'))  # all-zero appliance; BCE always off
+            thresholds_scaled.append(float('inf'))
         else:
             thresholds_scaled.append(
                 (THRESHOLDS[app] - float(y_scalers[i].data_min_[0])) / r
@@ -314,10 +327,10 @@ def train_pinn_model(data_dict, save_dir,
     te_loader = torch.utils.data.DataLoader(
         MultiApplianceDataset(X_te, Y_te), batch_size=BATCH, shuffle=False, drop_last=False)
 
-    # ── Model + losses ──
-    model = PhysicsInformedLTCLiquidNetworkModel(
+    model = PhysicsInformedStackedLiquidNetworkModel(
         input_size=INPUT_SIZE, hidden_size=hidden_size,
-        n_appliances=len(APPLIANCES), dt=dt,
+        n_layers=n_layers, n_appliances=len(APPLIANCES),
+        dt=dt, dropout=dropout,
     ).to(device)
 
     mse_criterion  = nn.MSELoss()
@@ -340,10 +353,9 @@ def train_pinn_model(data_dict, save_dir,
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
-    print("Starting PINN-LTC training (all appliances simultaneously)...")
+    print(f"Starting PINN-StackedLNN training ({n_layers} layers, all appliances simultaneously)...")
 
     for epoch in range(EPOCHS):
-        # ── Training ──
         model.train()
         ep_mse = ep_phys = ep_total = 0.0
         progress_bar = tqdm(tr_loader,
@@ -352,10 +364,10 @@ def train_pinn_model(data_dict, save_dir,
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
 
-            pred = model(xb)                                # (batch, n_apps)
+            pred = model(xb)
 
             mse_loss  = mse_criterion(pred, yb)
-            x_mid     = xb[:, WIN // 2, 0]                 # channel 0 = P
+            x_mid     = xb[:, WIN // 2, 0]
             phys_loss = phys_criterion(x_mid, pred)
 
             if epoch < WARMUP_EPOCHS:
@@ -393,7 +405,6 @@ def train_pinn_model(data_dict, save_dir,
         history['train_phys'].append(avg_tr_phys)
         history['train_loss'].append(avg_tr_total)
 
-        # ── Validation ──
         model.eval()
         vl_mse = vl_phys = vl_total = 0.0
         val_preds, val_trues = [], []
@@ -458,7 +469,6 @@ def train_pinn_model(data_dict, save_dir,
 
     print("Training completed!")
 
-    # ── Test evaluation ──
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
@@ -482,20 +492,19 @@ def train_pinn_model(data_dict, save_dir,
         print(f"{app:<15} {m['f1']:>8.4f} {m['precision']:>10.4f} "
               f"{m['recall']:>8.4f} {m['mae']:>8.2f} {m['sae']:>8.4f}")
 
-    # ── Plots ──
     _plot_training(history, test_metrics, save_dir)
 
-    # ── Save JSON ──
     config = {
         'dataset':     'AMPds_enriched',
-        'model':       'PhysicsInformedLTCLiquidNetworkModel',
-        'description': 'LTC LNN (input-dependent tau) + per-appliance heads + L_phys, input=[P,Q]',
+        'model':       'PhysicsInformedStackedLiquidNetworkModel',
+        'description': f'Stacked LNN ({n_layers} layers, fixed tau) + per-appliance heads + L_phys, input=[P,Q]',
         'loss':        f'MSE + {lambda_phys} * PhysicsConsistency(epsilon={epsilon_w}W) [stage2 only]',
         'input_size':  INPUT_SIZE,
         'window_size': WIN,
         'model_params': {
             'input_size': INPUT_SIZE, 'hidden_size': hidden_size,
-            'n_appliances': len(APPLIANCES), 'dt': dt,
+            'n_layers': n_layers, 'n_appliances': len(APPLIANCES),
+            'dt': dt, 'dropout': dropout,
         },
         'train_params': {
             'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
@@ -507,7 +516,7 @@ def train_pinn_model(data_dict, save_dir,
             for app, m in test_metrics.items()
         },
     }
-    with open(os.path.join(save_dir, 'pinn_ltc_lnn_ampds_enriched_results.json'),
+    with open(os.path.join(save_dir, 'pinn_stacked_lnn_ampds_enriched_results.json'),
               'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4)
 
@@ -545,13 +554,13 @@ def _plot_training(history, test_metrics, save_dir):
     plt.legend(); plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'pinn_ltc_lnn_ampds_enriched_loss.png'),
+    plt.savefig(os.path.join(save_dir, 'pinn_stacked_lnn_ampds_enriched_loss.png'),
                 dpi=150, bbox_inches='tight')
     plt.close()
 
     fig, axes = plt.subplots(len(APPLIANCES), 2,
                              figsize=(12, 4 * len(APPLIANCES)))
-    fig.suptitle('PINN-LTC AMPds enriched (P+Q) -- Per-Appliance Val Metrics',
+    fig.suptitle('PINN-StackedLNN AMPds enriched (P+Q) -- Per-Appliance Val Metrics',
                  fontsize=13)
 
     for row, app in enumerate(APPLIANCES):
@@ -576,7 +585,7 @@ def _plot_training(history, test_metrics, save_dir):
         ax_mae.legend(); ax_mae.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'pinn_ltc_lnn_ampds_enriched_per_appliance.png'),
+    plt.savefig(os.path.join(save_dir, 'pinn_stacked_lnn_ampds_enriched_per_appliance.png'),
                 dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -593,7 +602,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir  = f"models/pinn_ltc_lnn_ampds_enriched_{timestamp}"
+    save_dir  = f"models/pinn_stacked_lnn_ampds_enriched_{timestamp}"
 
     data_dict = load_data()
 
@@ -601,9 +610,11 @@ if __name__ == "__main__":
         data_dict,
         save_dir    = save_dir,
         hidden_size = 64,
+        n_layers    = N_LAYERS,
         dt          = 0.1,
         lambda_phys = LAMBDA_PHYS,
         epsilon_w   = EPSILON_W,
+        dropout     = DROPOUT,
     )
 
     print(f"\nResults saved to {save_dir}")
