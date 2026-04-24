@@ -16,10 +16,10 @@ Meter mapping:
   meter11 = FGE  fridge          -> "fridge"
   meter14 = HPE  heat pump       -> "heat pump"
 
-Splits (1-min resolution, same as data/AMPds/):
-  train : 2013-11-21
-  val   : 2013-12-31
-  test  : 2012-08-23
+Splits (1-min resolution):
+  train : 2013-11-21  to  2013-11-27  (7 days)
+  val   : 2013-12-31                  (1 day)
+  test  : 2012-08-23                  (1 day)
 """
 
 import os
@@ -47,9 +47,9 @@ METER_MAP = {
 }
 
 SPLITS = {
-    'train': '2013-11-21',
-    'val':   '2013-12-31',
-    'test':  '2012-08-23',
+    'train': ('2013-11-21', '2013-11-27'),
+    'val':   ('2013-12-31', '2013-12-31'),
+    'test':  ('2012-08-23', '2012-08-23'),
 }
 
 
@@ -62,11 +62,11 @@ def read_meter_column(h5path: str, meter_num: int, col_idx: int) -> pd.Series:
     return pd.Series(vals.astype(np.float32), index=idx)
 
 
-def build_split(series_map: dict, day: str) -> pd.DataFrame:
+def build_split(series_map: dict, start: str, end: str) -> pd.DataFrame:
     resampled = {}
     for col, s in series_map.items():
         resampled[col] = (
-            s.loc[day]
+            s.loc[start:end]
              .resample(FREQ)
              .mean()
              .ffill()
@@ -88,9 +88,9 @@ def main():
         print(f'  meter{meter_num}  col={col_idx}  -> "{col}"')
         series_map[col] = read_meter_column(H5_PATH, meter_num, col_idx)
 
-    for split, day in SPLITS.items():
-        print(f'\nBuilding {split} split  ({day}) ...')
-        df = build_split(series_map, day)
+    for split, (start, end) in SPLITS.items():
+        print(f'\nBuilding {split} split  ({start} to {end}) ...')
+        df = build_split(series_map, start, end)
         print(f'  shape : {df.shape}')
         print(f'  cols  : {list(df.columns)}')
         print(f'  sample:\n{df.head(3).to_string()}')
