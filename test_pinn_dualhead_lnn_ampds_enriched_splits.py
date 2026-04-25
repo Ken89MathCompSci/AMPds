@@ -7,23 +7,23 @@ output head with a pair of heads:
     power_head  : Linear(hidden -> 1) + ReLU   -- how much power (regression)
     state_head  : Linear(hidden -> 1) + sigmoid -- is it ON?   (classification)
 
-    final_pred  = state * power                 -- zeros out power when OFF
+    final_pred  = state * power                 -- gated at inference only
 
-This separates the two learning problems:
-    MSE trains on (state * power) vs true_power -- regression accuracy
-    BCE trains on state vs y_bin               -- ON/OFF boundary
+Training is DECOUPLED so neither head kills the other's gradients:
+    MSE trains on pred_power directly vs true_power  -- power head always gets gradients
+    BCE trains on pred_state vs y_bin                -- state head always gets gradients
+    Physics loss uses (pred_state * pred_power)      -- physically meaningful gated sum
+    Inference: final_pred = pred_state * pred_power  -- apply gating only at output time
 
-Previously, MSE alone pushed predictions toward the training mean (above the
-10W threshold even for OFF samples). Now the state head is explicitly trained
-to output 0 for OFF samples, which zeroes the final prediction regardless of
-the power head.
+The prior coupled approach (MSE on state*power) caused gradient killing:
+when BCE pushed state->0, d(MSE)/d(power) = state * grad ≈ 0, deadlocking both heads.
 
 Loss:
-    Stage 1 (epochs 1-WARMUP_EPOCHS): MSE only (on state * power)
-    Stage 2 (remaining epochs):       MSE + lambda * HuberPhys + weighted BCE
+    Stage 1 (epochs 1-WARMUP_EPOCHS): MSE only (on pred_power)
+    Stage 2 (remaining epochs):       MSE(pred_power) + lambda * HuberPhys(gated) + weighted BCE(state)
 
 Physics constraint (Huber-style, active-power channel only):
-    violation = ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon)
+    violation = ReLU(sum_i p_hat_i_gated_raw - P_agg_raw - epsilon)
     L_phys    = huber_loss(violation, 0, delta=HUBER_DELTA)
 """
 
@@ -178,8 +178,10 @@ class PhysicsInformedDualHeadLiquidNetworkModel(nn.Module):
         """
         x: (batch, seq_len, input_size)
         returns:
-            pred  : (batch, n_apps)  final prediction = state * power
-            state : (batch, n_apps)  ON probability, used for BCE
+            power : (batch, n_apps)  raw power magnitude (no state gating)
+            state : (batch, n_apps)  ON probability [0,1], used for BCE
+        Caller is responsible for gating: final_pred = state * power at inference.
+        Training uses each head output independently to avoid gradient killing.
         """
         batch_size, seq_len, _ = x.size()
         h   = torch.zeros(batch_size, self.hidden_size, device=x.device)
@@ -195,10 +197,9 @@ class PhysicsInformedDualHeadLiquidNetworkModel(nn.Module):
 
         h = self.norm(h)
 
-        power = torch.cat([F.relu(head(h))     for head in self.power_heads], dim=1)
+        power = torch.cat([F.relu(head(h))        for head in self.power_heads], dim=1)
         state = torch.cat([torch.sigmoid(head(h)) for head in self.state_heads], dim=1)
-        pred  = state * power
-        return pred, state
+        return power, state
 
 
 # ---------------------------------------------------------------------------
@@ -366,11 +367,14 @@ def train_pinn_model(data_dict, save_dir,
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
 
-            pred, state = model(xb)           # pred = state * power
+            # Decoupled: forward returns raw power + state separately (no multiplication)
+            pred_power, pred_state = model(xb)
+            pred_gated = pred_state * pred_power   # used only for physics loss
 
-            mse_loss  = mse_criterion(pred, yb)
+            # MSE directly on power head -- always has clean gradients regardless of state
+            mse_loss  = mse_criterion(pred_power, yb)
             x_mid     = xb[:, WIN // 2, 0]
-            phys_loss = phys_criterion(x_mid, pred)
+            phys_loss = phys_criterion(x_mid, pred_gated)
 
             if epoch < WARMUP_EPOCHS:
                 loss = mse_loss
@@ -378,7 +382,7 @@ def train_pinn_model(data_dict, save_dir,
                 bce_loss = torch.tensor(0.0, device=device)
                 for i, app in enumerate(APPLIANCES):
                     if BCE_LAMBDA[app] > 0:
-                        state_i = state[:, i].clamp(1e-7, 1 - 1e-7)
+                        state_i = pred_state[:, i].clamp(1e-7, 1 - 1e-7)
                         thr_s   = thresholds_scaled[i]
                         y_bin   = (yb[:, i] > thr_s).float()
                         w       = torch.where(y_bin == 1,
@@ -413,18 +417,19 @@ def train_pinn_model(data_dict, save_dir,
 
         with torch.no_grad():
             for xb, yb in va_loader:
-                xb, yb   = xb.to(device), yb.to(device)
-                pred, _  = model(xb)
+                xb, yb          = xb.to(device), yb.to(device)
+                pred_power, pred_state = model(xb)
+                pred_gated      = pred_state * pred_power   # gated inference output
 
-                mse_loss  = mse_criterion(pred, yb)
+                mse_loss  = mse_criterion(pred_power, yb)
                 x_mid     = xb[:, WIN // 2, 0]
-                phys_loss = phys_criterion(x_mid, pred)
+                phys_loss = phys_criterion(x_mid, pred_gated)
                 loss      = mse_loss + lambda_phys * phys_loss
 
                 vl_mse   += mse_loss.item()
                 vl_phys  += phys_loss.item()
                 vl_total += loss.item()
-                val_preds.append(pred.cpu().numpy())
+                val_preds.append(pred_gated.cpu().numpy())
                 val_trues.append(yb.cpu().numpy())
 
         avg_va_mse   = vl_mse   / len(va_loader)
@@ -478,8 +483,9 @@ def train_pinn_model(data_dict, save_dir,
     test_preds, test_trues = [], []
     with torch.no_grad():
         for xb, yb in te_loader:
-            pred, _ = model(xb.to(device))
-            test_preds.append(pred.cpu().numpy())
+            pred_power, pred_state = model(xb.to(device))
+            pred_gated = pred_state * pred_power   # gated inference output
+            test_preds.append(pred_gated.cpu().numpy())
             test_trues.append(yb.cpu().numpy())
 
     y_pred_te = np.concatenate(test_preds)
@@ -500,11 +506,11 @@ def train_pinn_model(data_dict, save_dir,
     config = {
         'dataset':     'AMPds_enriched',
         'model':       'PhysicsInformedDualHeadLiquidNetworkModel',
-        'description': ('dual-head LNN (power*state) + Huber L_phys '
-                        '+ BCE_ALPHA/BETA, input=[P,Q]'),
-        'loss':        (f'MSE(state*power) + {lambda_phys} * HuberPhys'
-                        f'(epsilon={epsilon_w}W, delta={huber_delta}W) '
-                        f'+ weighted BCE(state) [stage2 only]'),
+        'description': ('dual-head LNN decoupled: MSE(power) + BCE(state) + Huber L_phys '
+                        '+ BCE_ALPHA/BETA, inference=state*power, input=[P,Q]'),
+        'loss':        (f'MSE(pred_power) + {lambda_phys} * HuberPhys(gated,'
+                        f'epsilon={epsilon_w}W, delta={huber_delta}W) '
+                        f'+ weighted BCE(pred_state) [stage2 only]'),
         'input_size':  INPUT_SIZE,
         'window_size': WIN,
         'model_params': {
