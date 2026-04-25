@@ -1,31 +1,32 @@
 """
-Physics-Informed Basic LNN with Uncertainty Weighting (PINN-UW-BasicLNN)
+Physics-Informed Basic LNN with Softplus Physics Loss (PINN-SoftplusLNN)
 for NILM -- AMPds enriched splits (P + Q).
 
 Based on test_pinn_basic_lnn_ampds_enriched_splits.py.
 
-Key change: fixed LAMBDA_PHYS is replaced with learnable uncertainty weights
-following Kendall et al. (2018) "Multi-Task Learning Using Uncertainty to
-Weigh Losses in Deep Learning".
+Key change: the physics consistency constraint replaces the hard ReLU with a
+differentiable Softplus (log-sum-exp) approximation:
 
-Loss formulation (stage 2, post-warmup):
-    s_i = log(sigma_i^2)    -- learnable log-variance per loss component
-    L_total = sum_i [ 0.5 * exp(-s_i) * L_i  +  0.5 * s_i ]
+    ReLU (original):
+        L_phys = mean[ ReLU(p_sum - P_agg - epsilon) ]
+        Gradient = 0 when constraint is satisfied → dead zone
 
-    where i in {mse, phys, bce, fp}
+    Softplus (this script):
+        L_phys = mean[ softplus_beta(p_sum - P_agg - epsilon) ]
+               = mean[ (1/beta) * log(1 + exp(beta * (p_sum - P_agg - eps))) ]
+        Gradient = sigmoid(beta * (p_sum - P_agg - eps)) > 0 always
+                 → non-zero gradient even when constraint is satisfied,
+                   providing a continuous "pull" toward energy conservation.
 
-During warmup (epochs 1..WARMUP_EPOCHS):  only L_MSE (no weighting).
-After warmup:  uncertainty-weighted MSE + Phys + BCE + FP.
+    As beta → ∞, softplus → ReLU.
+    Default beta=1.0 gives the smoothest gradient signal.
 
-FP loss: mean squared prediction over OFF-state windows, averaged across
-appliances.  Directly penalises predicting "ON" when ground truth is "OFF"
-to address the high-recall / low-precision failure mode.
+Architecture: identical to base BasicLNN -- same BasicLiquidTimeLayer encoder
+    + per-appliance linear heads.  Only the physics loss activation changes.
 
-To prevent gradient shock at the warmup→stage2 boundary, log_var is
-initialised to [0.0, 3.0, 4.0] so phys/BCE start at precision ~0.05/0.018.
-UW parameters use LR*10 so they track the loss balance quickly.
-
-Architecture: same BasicLNN as base script.
+Loss (unchanged stage structure):
+    Stage 1 (epochs 1-WARMUP_EPOCHS): MSE only
+    Stage 2 (remaining epochs):       MSE + lambda * L_phys_softplus + weighted BCE
 """
 
 import sys
@@ -57,8 +58,13 @@ WIN           = 100
 STRIDE        = 5
 INPUT_SIZE    = 2        # main (W)  +  main_Q (VAR)
 
+LAMBDA_PHYS   = 0.01
 EPSILON_W     = 50.0
 WARMUP_EPOCHS = 20
+
+# Softplus sharpness: beta=1 (smooth) → beta=10 (near-ReLU)
+# A range of {0.5, 1.0, 2.0, 5.0} is worth comparing; default 1.0.
+SOFTPLUS_BETA = 1.0
 
 DATA_DIR = 'data/AMPds_enriched_data'
 
@@ -87,75 +93,32 @@ BCE_ALPHA = {
 
 
 # ---------------------------------------------------------------------------
-# Uncertainty Weighting module (Kendall et al., 2018)
-# ---------------------------------------------------------------------------
-
-class UncertaintyWeighting(nn.Module):
-    """
-    Learnable log-variance parameters for multi-task loss balancing.
-
-    For each task i:
-        weighted_loss_i = 0.5 * exp(-s_i) * L_i  +  0.5 * s_i
-        where s_i = log(sigma_i^2)  (initialised to 0 -> sigma=1)
-
-    The first term down-weights L_i as uncertainty grows; the second term
-    acts as a regulariser that prevents sigma from collapsing to infinity.
-    """
-
-    def __init__(self, n_tasks: int = 3,
-                 init_log_var: list | None = None,
-                 clamp_lo: list | None = None,
-                 clamp_hi: list | None = None):
-        super().__init__()
-        # log(sigma^2); default 0 => sigma=1, weight=0.5
-        # Pass higher init values to start a task heavily down-weighted
-        if init_log_var is not None:
-            assert len(init_log_var) == n_tasks
-            init = torch.tensor(init_log_var, dtype=torch.float32)
-        else:
-            init = torch.zeros(n_tasks)
-        self.log_var = nn.Parameter(init)
-        # Per-task clamp bounds (lists of length n_tasks or None for uniform)
-        self.clamp_lo = clamp_lo if clamp_lo is not None else [-3.0] * n_tasks
-        self.clamp_hi = clamp_hi if clamp_hi is not None else [ 6.0] * n_tasks
-
-    def forward(self, *losses):
-        """
-        losses: sequence of scalar tensors, one per task.
-        Returns: total weighted loss, list of per-task precision weights.
-
-        Per-task clamp bounds on log_var:
-          MSE lower = -3  => precision cap exp(3)≈20×
-          FP/phys/BCE lower = -1  => precision cap exp(1)≈2.7×
-            prevents FP from fighting MSE at equal strength,
-            which caused heat pump recall collapse in earlier runs.
-          Upper = 6 for all => precision floor exp(-6)≈0.002 (never fully silent)
-        """
-        assert len(losses) == self.log_var.numel(), \
-            f"Expected {self.log_var.numel()} losses, got {len(losses)}"
-        total = torch.tensor(0.0, device=self.log_var.device)
-        precisions = []
-        for i, loss_i in enumerate(losses):
-            s_i        = self.log_var[i].clamp(self.clamp_lo[i], self.clamp_hi[i])
-            precision  = torch.exp(-s_i)          # 1 / sigma_i^2
-            weighted   = 0.5 * precision * loss_i + 0.5 * s_i
-            total      = total + weighted
-            precisions.append(precision.item())
-        return total, precisions
-
-
-# ---------------------------------------------------------------------------
-# Physics Consistency Loss  (active-power channel only)
+# Physics Consistency Loss  (Softplus activation)
 # ---------------------------------------------------------------------------
 
 class PhysicsConsistencyLoss(nn.Module):
     """
-    Soft one-sided penalty:  ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon)
+    Soft one-sided penalty using Softplus instead of ReLU:
+
+        L_phys = mean[ (1/beta) * log(1 + exp(beta*(p_sum_raw - P_agg_raw - eps))) ]
+
+    Gradient w.r.t. p_sum_raw:
+        dL/dp_sum = sigmoid(beta*(p_sum_raw - P_agg_raw - eps))
+
+    Unlike ReLU, this gradient is never exactly zero:
+        - When deeply satisfied (p_sum << P_agg): gradient ≈ exp(beta*excess) → tiny
+        - Near boundary:                          gradient ≈ 0.5 (sigmoid(0))
+        - When violated (p_sum >> P_agg):         gradient → 1
+
+    x_mid_scaled comes from channel 0 (active power P).
+    x_scaler_P is the MinMaxScaler fitted on the P channel.
     """
 
-    def __init__(self, x_scaler_P, y_scalers, appliances, epsilon_w=EPSILON_W):
+    def __init__(self, x_scaler_P, y_scalers, appliances,
+                 epsilon_w=EPSILON_W, beta=SOFTPLUS_BETA):
         super().__init__()
         self.epsilon = epsilon_w
+        self.beta    = beta
 
         x_min   = float(x_scaler_P.data_min_[0])
         x_range = float(x_scaler_P.data_range_[0])
@@ -168,19 +131,28 @@ class PhysicsConsistencyLoss(nn.Module):
         self.register_buffer('y_ranges', torch.tensor(y_ranges, dtype=torch.float32))
 
     def forward(self, x_mid_scaled, pred_scaled):
-        x_raw     = x_mid_scaled * self.x_range + self.x_min
-        p_raw     = pred_scaled  * self.y_ranges + self.y_mins
-        p_sum     = p_raw.sum(dim=1)
-        violation = F.relu(p_sum - x_raw - self.epsilon)
-        return violation.mean()
+        x_raw  = x_mid_scaled * self.x_range + self.x_min   # (batch,)
+        p_raw  = pred_scaled  * self.y_ranges + self.y_mins  # (batch, n_apps)
+        p_sum  = p_raw.sum(dim=1)
+        # Softplus: smooth approximation to ReLU with non-zero gradient everywhere
+        penalty = F.softplus(p_sum - x_raw - self.epsilon, beta=self.beta)
+        return penalty.mean()
 
 
 # ---------------------------------------------------------------------------
-# Basic LNN Model (fixed tau, no gate)
+# Basic LNN Model (fixed tau, no gate)  -- identical to base script
 # ---------------------------------------------------------------------------
 
 class PhysicsInformedBasicLiquidNetworkModel(nn.Module):
-    """Single BasicLiquidTimeLayer encoder -> per-appliance linear heads."""
+    """
+    Single BasicLiquidTimeLayer encoder -> per-appliance linear heads.
+
+    Cell update:
+        tau       = softplus(tau_param)          -- fixed, not input-dependent
+        f_t       = tanh(W_in*x_t + W_rec*h)
+        dh        = (-h / tau + f_t) * dt
+        h_new     = clamp(h + dh, -10, 10)
+    """
 
     def __init__(self, input_size, hidden_size, n_appliances, dt=0.1):
         super().__init__()
@@ -201,9 +173,10 @@ class PhysicsInformedBasicLiquidNetworkModel(nn.Module):
         ])
 
     def forward(self, x):
+        """x: (batch, seq_len, input_size)"""
         batch_size, seq_len, _ = x.size()
         h   = torch.zeros(batch_size, self.hidden_size, device=x.device)
-        tau = F.softplus(self.tau).unsqueeze(0)
+        tau = F.softplus(self.tau).unsqueeze(0)   # (1, hidden)
 
         for t in range(seq_len):
             x_t        = x[:, t, :]
@@ -251,6 +224,7 @@ def load_data():
 
 
 def create_sequences(data, window_size=WIN):
+    """Two-channel input [P, Q]; midpoint targeting for appliance labels."""
     mains = np.stack(
         [data['main'].values, data['main_Q'].values], axis=-1
     ).astype(np.float32)
@@ -267,6 +241,7 @@ def create_sequences(data, window_size=WIN):
 
 
 def _scale_X(X_tr, X_va, X_te):
+    """Per-channel MinMaxScaler on train."""
     n_tr, n_va, n_te = X_tr.shape[0], X_va.shape[0], X_te.shape[0]
     X_tr_n = X_tr.copy()
     X_va_n = X_va.copy()
@@ -306,12 +281,15 @@ def compute_per_appliance_metrics(y_true, y_pred, y_scalers):
 
 def train_pinn_model(data_dict, save_dir,
                      hidden_size=64, dt=0.1,
-                     epsilon_w=EPSILON_W):
+                     lambda_phys=LAMBDA_PHYS, epsilon_w=EPSILON_W,
+                     softplus_beta=SOFTPLUS_BETA):
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"epsilon={epsilon_w} W  hidden={hidden_size}  dt={dt}")
-    print("Loss weighting: Kendall et al. uncertainty weighting (learnable sigma)")
+    print(f"lambda_phys={lambda_phys}  epsilon={epsilon_w} W  "
+          f"softplus_beta={softplus_beta}  hidden={hidden_size}  dt={dt}")
+    print(f"Physics activation: Softplus(beta={softplus_beta})  "
+          f"[beta=1=smooth, beta→∞=ReLU]")
 
     # ── Sequences ──
     X_tr, Y_tr = create_sequences(data_dict['train'], WIN)
@@ -351,97 +329,66 @@ def train_pinn_model(data_dict, save_dir,
     te_loader = torch.utils.data.DataLoader(
         MultiApplianceDataset(X_te, Y_te), batch_size=BATCH, shuffle=False, drop_last=False)
 
-    # ── Model ──
+    # ── Model + losses ──
     model = PhysicsInformedBasicLiquidNetworkModel(
         input_size=INPUT_SIZE, hidden_size=hidden_size,
         n_appliances=len(APPLIANCES), dt=dt,
     ).to(device)
 
-    # ── Uncertainty weighting: 4 tasks (mse, phys, bce, fp) ──
-    # Phys/BCE/FP start heavily down-weighted (log_var >> 0) so the
-    # warmup→stage2 transition doesn't cause gradient shock.
-    # Per-task lower clamps:
-    #   MSE: -3 => precision cap ≈20×
-    #   Phys/BCE/FP: -1 => precision cap ≈2.7× (prevents FP from
-    #     overwhelming MSE and collapsing heat pump recall)
-    uw = UncertaintyWeighting(
-        n_tasks=4,
-        init_log_var=[0.0,  3.0,  4.0,  2.0],
-        clamp_lo    =[-3.0, -1.0, -1.0, -1.0],
-        clamp_hi    =[ 6.0,  6.0,  6.0,  6.0],
-    ).to(device)
-
     mse_criterion  = nn.MSELoss()
     phys_criterion = PhysicsConsistencyLoss(
-        x_scalers[0], y_scalers, APPLIANCES, epsilon_w=epsilon_w
+        x_scalers[0], y_scalers, APPLIANCES,
+        epsilon_w=epsilon_w, beta=softplus_beta,
     ).to(device)
 
-    # UW log_var params use 10x LR so they adapt fast enough to steer
-    # loss balance across the warmup->stage2 transition.
-    optimizer = torch.optim.Adam([
-        {'params': model.parameters(), 'lr': LR},
-        {'params': uw.parameters(),    'lr': LR * 10},
-    ])
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=8, min_lr=1e-5)
 
     history = {
-        'train_loss': [], 'train_mse': [], 'train_phys': [], 'train_fp': [],
-        'val_loss':   [], 'val_mse':   [], 'val_phys':   [], 'val_fp':   [],
-        # log_var history: shape (epochs, 4) -> [mse, phys, bce, fp]
-        'log_var':    [],
+        'train_loss': [], 'train_mse': [], 'train_phys': [],
+        'val_loss':   [], 'val_mse':   [], 'val_phys':   [],
         'val_metrics': [],
     }
     best_val_loss = float('inf')
     best_state    = None
     counter       = 0
 
-    n_params = (sum(p.numel() for p in model.parameters() if p.requires_grad)
-                + sum(p.numel() for p in uw.parameters()))
-    print(f"Model parameters: {n_params:,}  (includes 4 uncertainty log-var params)")
-    print("Starting PINN-UW-BasicLNN training...")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {n_params:,}")
+    print("Starting PINN-SoftplusLNN training (all appliances simultaneously)...")
 
     for epoch in range(EPOCHS):
         # ── Training ──
         model.train()
-        uw.train()
-        ep_mse = ep_phys = ep_fp = ep_total = 0.0
+        ep_mse = ep_phys = ep_total = 0.0
         progress_bar = tqdm(tr_loader,
                             desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False)
         for xb, yb in progress_bar:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
 
-            pred = model(xb)
+            pred = model(xb)                                # (batch, n_apps)
 
             mse_loss  = mse_criterion(pred, yb)
-            x_mid     = xb[:, WIN // 2, 0]
+            x_mid     = xb[:, WIN // 2, 0]                 # channel 0 = P
             phys_loss = phys_criterion(x_mid, pred)
 
             if epoch < WARMUP_EPOCHS:
-                # Stage 1: plain MSE (uncertainty weights not yet involved)
-                loss    = mse_loss
-                fp_loss = torch.tensor(0.0, device=device)
+                loss = mse_loss
             else:
-                # Stage 2: uncertainty-weighted MSE + Phys + BCE + FP
                 bce_loss = torch.tensor(0.0, device=device)
-                fp_loss  = torch.tensor(0.0, device=device)
                 for i, app in enumerate(APPLIANCES):
-                    thr_s    = thresholds_scaled[i]
-                    off_mask = yb[:, i] <= thr_s
-                    if off_mask.any():
-                        fp_loss = fp_loss + (pred[:, i][off_mask].clamp(min=0) ** 2).mean()
                     if BCE_LAMBDA[app] > 0:
                         pred_i = pred[:, i].clamp(1e-7, 1 - 1e-7)
+                        thr_s  = thresholds_scaled[i]
                         y_bin  = (yb[:, i] > thr_s).float()
                         w      = torch.where(y_bin == 1,
                                              torch.full_like(y_bin, BCE_ALPHA[app]),
                                              torch.ones_like(y_bin))
                         bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                             pred_i, y_bin, weight=w)
-                fp_loss = fp_loss / len(APPLIANCES)
-
-                loss, _ = uw(mse_loss, phys_loss, bce_loss, fp_loss)
+                loss = mse_loss + lambda_phys * phys_loss + bce_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -449,31 +396,22 @@ def train_pinn_model(data_dict, save_dir,
 
             ep_mse   += mse_loss.item()
             ep_phys  += phys_loss.item()
-            ep_fp    += fp_loss.item()
             ep_total += loss.item()
             progress_bar.set_postfix({
                 'mse':  f'{mse_loss.item():.5f}',
                 'phys': f'{phys_loss.item():.5f}',
-                'fp':   f'{fp_loss.item():.5f}',
             })
 
         avg_tr_mse   = ep_mse   / len(tr_loader)
         avg_tr_phys  = ep_phys  / len(tr_loader)
-        avg_tr_fp    = ep_fp    / len(tr_loader)
         avg_tr_total = ep_total / len(tr_loader)
         history['train_mse'].append(avg_tr_mse)
         history['train_phys'].append(avg_tr_phys)
-        history['train_fp'].append(avg_tr_fp)
         history['train_loss'].append(avg_tr_total)
-
-        # record current log_var values
-        lv = uw.log_var.detach().cpu().tolist()
-        history['log_var'].append(lv)
 
         # ── Validation ──
         model.eval()
-        uw.eval()
-        vl_mse = vl_phys = vl_fp = vl_total = 0.0
+        vl_mse = vl_phys = vl_total = 0.0
         val_preds, val_trues = [], []
 
         with torch.no_grad():
@@ -484,43 +422,19 @@ def train_pinn_model(data_dict, save_dir,
                 mse_loss  = mse_criterion(pred, yb)
                 x_mid     = xb[:, WIN // 2, 0]
                 phys_loss = phys_criterion(x_mid, pred)
-                # val loss: weighted combination (or plain MSE during warmup)
-                if epoch < WARMUP_EPOCHS:
-                    val_loss = mse_loss
-                    fp_loss  = torch.tensor(0.0, device=device)
-                else:
-                    bce_loss = torch.tensor(0.0, device=device)
-                    fp_loss  = torch.tensor(0.0, device=device)
-                    for i, app in enumerate(APPLIANCES):
-                        thr_s    = thresholds_scaled[i]
-                        off_mask = yb[:, i] <= thr_s
-                        if off_mask.any():
-                            fp_loss = fp_loss + (pred[:, i][off_mask].clamp(min=0) ** 2).mean()
-                        if BCE_LAMBDA[app] > 0:
-                            pred_i = pred[:, i].clamp(1e-7, 1 - 1e-7)
-                            y_bin  = (yb[:, i] > thr_s).float()
-                            w      = torch.where(y_bin == 1,
-                                                 torch.full_like(y_bin, BCE_ALPHA[app]),
-                                                 torch.ones_like(y_bin))
-                            bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
-                                pred_i, y_bin, weight=w)
-                    fp_loss  = fp_loss / len(APPLIANCES)
-                    val_loss, _ = uw(mse_loss, phys_loss, bce_loss, fp_loss)
+                loss      = mse_loss + lambda_phys * phys_loss
 
                 vl_mse   += mse_loss.item()
                 vl_phys  += phys_loss.item()
-                vl_fp    += fp_loss.item()
-                vl_total += val_loss.item()
+                vl_total += loss.item()
                 val_preds.append(pred.cpu().numpy())
                 val_trues.append(yb.cpu().numpy())
 
         avg_va_mse   = vl_mse   / len(va_loader)
         avg_va_phys  = vl_phys  / len(va_loader)
-        avg_va_fp    = vl_fp    / len(va_loader)
         avg_va_total = vl_total / len(va_loader)
         history['val_mse'].append(avg_va_mse)
         history['val_phys'].append(avg_va_phys)
-        history['val_fp'].append(avg_va_fp)
         history['val_loss'].append(avg_va_total)
 
         scheduler.step(avg_va_mse)
@@ -534,41 +448,18 @@ def train_pinn_model(data_dict, save_dir,
         avg_f1  = np.mean([per_app_metrics[a]['f1']  for a in APPLIANCES])
         avg_mae = np.mean([per_app_metrics[a]['mae'] for a in APPLIANCES])
 
-        # Compute effective weights = exp(-log_var) for display
-        # (clamp mirrors per-task forward clamps so display is consistent)
-        lo = uw.clamp_lo
-        hi = uw.clamp_hi
-        lv_clamped = [max(lo[i], min(hi[i], lv[i])) for i in range(len(lv))]
-        sig_mse  = np.exp(-lv_clamped[0])
-        sig_phys = np.exp(-lv_clamped[1])
-        sig_bce  = np.exp(-lv_clamped[2])
-        sig_fp   = np.exp(-lv_clamped[3])
-
         print(
             f"  Epoch {epoch+1:3d}/{EPOCHS}  "
-            f"train={avg_tr_total:.5f} (mse={avg_tr_mse:.5f} phys={avg_tr_phys:.5f} fp={avg_tr_fp:.5f})  "
-            f"val={avg_va_total:.5f} (mse={avg_va_mse:.5f} phys={avg_va_phys:.5f} fp={avg_va_fp:.5f})  "
+            f"train={avg_tr_total:.5f} (mse={avg_tr_mse:.5f} phys={avg_tr_phys:.5f})  "
+            f"val={avg_va_total:.5f} (mse={avg_va_mse:.5f} phys={avg_va_phys:.5f})  "
             f"avgF1={avg_f1:.4f}  avgMAE={avg_mae:.2f}  "
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
-        )
-        print(
-            f"    UW precisions (1/sigma^2):  "
-            f"mse={sig_mse:.4f}  phys={sig_phys:.4f}  bce={sig_bce:.4f}  fp={sig_fp:.4f}  "
-            f"[log_var: {lv[0]:.3f} {lv[1]:.3f} {lv[2]:.3f} {lv[3]:.3f}]"
         )
         for app in APPLIANCES:
             m = per_app_metrics[app]
             print(f"    {app:<14}  F1={m['f1']:.4f}  "
                   f"P={m['precision']:.4f}  R={m['recall']:.4f}  "
                   f"MAE={m['mae']:.2f}  SAE={m['sae']:.4f}")
-
-        # Reset model selection at the warmup→stage2 boundary so the
-        # saved best state is guaranteed to come from the FP-aware regime.
-        if epoch + 1 == WARMUP_EPOCHS:
-            best_val_loss = float('inf')
-            counter       = 0
-            print(f"  [Warmup end] Model selection reset — "
-                  f"stage-2 FP-aware training begins.")
 
         if avg_va_mse < best_val_loss:
             best_val_loss = avg_va_mse
@@ -607,20 +498,7 @@ def train_pinn_model(data_dict, save_dir,
               f"{m['recall']:>8.4f} {m['mae']:>8.2f} {m['sae']:>8.4f}")
 
     # ── Plots ──
-    _plot_training(history, test_metrics, save_dir)
-
-    # ── Final learned uncertainty parameters ──
-    final_lv = uw.log_var.detach().cpu().tolist()
-    lo = uw.clamp_lo
-    hi = uw.clamp_hi
-    final_lv_c = [max(lo[i], min(hi[i], final_lv[i])) for i in range(len(final_lv))]
-    print(f"\nFinal learned log_var: mse={final_lv[0]:.4f}  "
-          f"phys={final_lv[1]:.4f}  bce={final_lv[2]:.4f}  fp={final_lv[3]:.4f}")
-    print(f"  => effective precision (1/sigma^2): "
-          f"mse={np.exp(-final_lv_c[0]):.4f}  "
-          f"phys={np.exp(-final_lv_c[1]):.4f}  "
-          f"bce={np.exp(-final_lv_c[2]):.4f}  "
-          f"fp={np.exp(-final_lv_c[3]):.4f}")
+    _plot_training(history, test_metrics, save_dir, softplus_beta)
 
     # ── Save JSON ──
     config = {
@@ -628,10 +506,16 @@ def train_pinn_model(data_dict, save_dir,
         'model':       'PhysicsInformedBasicLiquidNetworkModel',
         'description': (
             'basic LNN (fixed tau, no gate) + per-appliance heads + '
-            'Kendall uncertainty-weighted losses (MSE, Phys, BCE, FP)'),
-        'loss':        (
-            'UW: 0.5*exp(-s_i)*L_i + 0.5*s_i  for i in {mse, phys, bce, fp} '
-            f'[warmup {WARMUP_EPOCHS} epochs: plain MSE]'),
+            f'Softplus physics loss (beta={softplus_beta}), input=[P,Q]'),
+        'loss': (
+            f'MSE + {lambda_phys} * Softplus_beta{softplus_beta}'
+            f'(p_sum - P_agg - {epsilon_w}W) [stage2 only]'),
+        'physics_activation': {
+            'type':        'softplus',
+            'beta':         softplus_beta,
+            'note':         ('beta=1=smooth; beta->inf=ReLU; '
+                             'gradient=sigmoid(beta*excess), always non-zero'),
+        },
         'input_size':  INPUT_SIZE,
         'window_size': WIN,
         'model_params': {
@@ -640,26 +524,15 @@ def train_pinn_model(data_dict, save_dir,
         },
         'train_params': {
             'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
-            'epsilon_w': epsilon_w, 'warmup_epochs': WARMUP_EPOCHS,
-        },
-        'final_log_var': {
-            'mse':  final_lv[0],
-            'phys': final_lv[1],
-            'bce':  final_lv[2],
-            'fp':   final_lv[3],
-        },
-        'final_precision_1_over_sigma2': {
-            'mse':  float(np.exp(-final_lv_c[0])),
-            'phys': float(np.exp(-final_lv_c[1])),
-            'bce':  float(np.exp(-final_lv_c[2])),
-            'fp':   float(np.exp(-final_lv_c[3])),
+            'lambda_phys': lambda_phys, 'epsilon_w': epsilon_w,
+            'warmup_epochs': WARMUP_EPOCHS,
         },
         'test_metrics': {
             app: {k: float(v) for k, v in m.items()}
             for app, m in test_metrics.items()
         },
     }
-    with open(os.path.join(save_dir, 'pinn_uw_basic_lnn_ampds_enriched_results.json'),
+    with open(os.path.join(save_dir, 'pinn_softplus_lnn_ampds_enriched_results.json'),
               'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4)
 
@@ -670,66 +543,49 @@ def train_pinn_model(data_dict, save_dir,
 # Plotting
 # ---------------------------------------------------------------------------
 
-def _plot_training(history, test_metrics, save_dir):
+def _plot_training(history, test_metrics, save_dir, softplus_beta):
     epochs_x = range(1, len(history['train_loss']) + 1)
 
-    fig, axes = plt.subplots(1, 5, figsize=(25, 4))
+    plt.figure(figsize=(15, 4))
 
-    axes[0].plot(epochs_x, history['train_loss'], label='Train total', color='blue')
-    axes[0].plot(epochs_x, history['val_loss'],   label='Val total',   color='red')
-    axes[0].set_title('Total Loss (UW)')
-    axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')
-    axes[0].legend(); axes[0].grid(True, alpha=0.3)
+    plt.subplot(1, 3, 1)
+    plt.plot(epochs_x, history['train_loss'], label='Train total', color='blue')
+    plt.plot(epochs_x, history['val_loss'],   label='Val total',   color='red')
+    plt.title(f'Total Loss (MSE + λ·Softplus[β={softplus_beta}])')
+    plt.xlabel('Epoch'); plt.ylabel('Loss')
+    plt.legend(); plt.grid(True, alpha=0.3)
 
-    axes[1].plot(epochs_x, history['train_mse'], label='Train MSE', color='blue')
-    axes[1].plot(epochs_x, history['val_mse'],   label='Val MSE',   color='red')
-    axes[1].set_title('MSE Loss')
-    axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('MSE')
-    axes[1].legend(); axes[1].grid(True, alpha=0.3)
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs_x, history['train_mse'], label='Train MSE', color='blue')
+    plt.plot(epochs_x, history['val_mse'],   label='Val MSE',   color='red')
+    plt.title('MSE Loss')
+    plt.xlabel('Epoch'); plt.ylabel('MSE')
+    plt.legend(); plt.grid(True, alpha=0.3)
 
-    axes[2].plot(epochs_x, history['train_phys'], label='Train Phys', color='blue')
-    axes[2].plot(epochs_x, history['val_phys'],   label='Val Phys',   color='red')
-    axes[2].set_title('Physics Consistency Loss')
-    axes[2].set_xlabel('Epoch'); axes[2].set_ylabel('L_phys')
-    axes[2].legend(); axes[2].grid(True, alpha=0.3)
-
-    axes[3].plot(epochs_x, history['train_fp'], label='Train FP', color='blue')
-    axes[3].plot(epochs_x, history['val_fp'],   label='Val FP',   color='red')
-    axes[3].set_title('False Positive Loss')
-    axes[3].set_xlabel('Epoch'); axes[3].set_ylabel('L_fp')
-    axes[3].legend(); axes[3].grid(True, alpha=0.3)
-
-    # Uncertainty log_var evolution (clamped per-task for display)
-    lv_raw = np.array(history['log_var'])                            # (epochs, 4)
-    lo_arr = np.array([-3.0, -1.0, -1.0, -1.0])
-    hi_arr = np.array([ 6.0,  6.0,  6.0,  6.0])
-    log_var_arr = np.clip(lv_raw, lo_arr, hi_arr)
-    axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 0]), label='1/sigma^2 MSE',  color='blue')
-    axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 1]), label='1/sigma^2 Phys', color='orange')
-    axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 2]), label='1/sigma^2 BCE',  color='green')
-    axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 3]), label='1/sigma^2 FP',   color='purple')
-    axes[4].axvline(WARMUP_EPOCHS, color='grey', linestyle='--', alpha=0.6,
-                    label=f'Warmup end (ep {WARMUP_EPOCHS})')
-    axes[4].set_title('Learned Precisions (1/sigma^2)')
-    axes[4].set_xlabel('Epoch'); axes[4].set_ylabel('Precision weight')
-    axes[4].legend(); axes[4].grid(True, alpha=0.3)
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs_x, history['train_phys'], label='Train Phys', color='blue')
+    plt.plot(epochs_x, history['val_phys'],   label='Val Phys',   color='red')
+    plt.title(f'Physics Loss — Softplus(β={softplus_beta})')
+    plt.xlabel('Epoch'); plt.ylabel('L_phys')
+    plt.legend(); plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'pinn_uw_basic_lnn_ampds_enriched_loss.png'),
+    plt.savefig(os.path.join(save_dir, 'pinn_softplus_lnn_ampds_enriched_loss.png'),
                 dpi=150, bbox_inches='tight')
     plt.close()
 
-    fig, axes_grid = plt.subplots(len(APPLIANCES), 2,
-                                  figsize=(12, 4 * len(APPLIANCES)))
-    fig.suptitle('PINN-UW-BasicLNN AMPds enriched (P+Q) -- Per-Appliance Val Metrics',
-                 fontsize=13)
+    fig, axes = plt.subplots(len(APPLIANCES), 2,
+                             figsize=(12, 4 * len(APPLIANCES)))
+    fig.suptitle(
+        f'PINN-SoftplusLNN AMPds enriched (P+Q) β={softplus_beta} -- Per-Appliance Val Metrics',
+        fontsize=13)
 
     for row, app in enumerate(APPLIANCES):
         f1_series  = [m[app]['f1']  for m in history['val_metrics']]
         mae_series = [m[app]['mae'] for m in history['val_metrics']]
 
-        ax_f1  = axes_grid[row][0]
-        ax_mae = axes_grid[row][1]
+        ax_f1  = axes[row][0]
+        ax_mae = axes[row][1]
 
         ax_f1.plot(epochs_x, f1_series, color='blue', linewidth=1.5)
         ax_f1.axhline(test_metrics[app]['f1'], color='green',
@@ -746,7 +602,7 @@ def _plot_training(history, test_metrics, save_dir):
         ax_mae.legend(); ax_mae.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'pinn_uw_basic_lnn_ampds_enriched_per_appliance.png'),
+    plt.savefig(os.path.join(save_dir, 'pinn_softplus_lnn_ampds_enriched_per_appliance.png'),
                 dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -763,16 +619,18 @@ if __name__ == "__main__":
             sys.exit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir  = f"models/pinn_uw_basic_lnn_ampds_enriched_{timestamp}"
+    save_dir  = f"models/pinn_softplus_lnn_ampds_enriched_{timestamp}"
 
     data_dict = load_data()
 
     test_metrics, history = train_pinn_model(
         data_dict,
-        save_dir    = save_dir,
-        hidden_size = 64,
-        dt          = 0.1,
-        epsilon_w   = EPSILON_W,
+        save_dir       = save_dir,
+        hidden_size    = 64,
+        dt             = 0.1,
+        lambda_phys    = LAMBDA_PHYS,
+        epsilon_w      = EPSILON_W,
+        softplus_beta  = SOFTPLUS_BETA,
     )
 
     print(f"\nResults saved to {save_dir}")
