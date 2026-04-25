@@ -10,17 +10,20 @@ output head with a pair of heads:
     final_pred  = state * power                 -- gated at inference only
 
 Training is DECOUPLED so neither head kills the other's gradients:
-    MSE trains on pred_power directly vs true_power  -- power head always gets gradients
-    BCE trains on pred_state vs y_bin                -- state head always gets gradients
-    Physics loss uses (pred_state * pred_power)      -- physically meaningful gated sum
-    Inference: final_pred = pred_state * pred_power  -- apply gating only at output time
+    Masked MSE trains on pred_power (ON samples only) -- power head learns E[P | ON]
+    BCE trains on pred_state vs y_bin from EPOCH 1   -- state head always supervised
+    Physics loss uses (pred_state * pred_power)       -- physically meaningful gated sum
+    Inference: final_pred = pred_state * pred_power   -- apply gating only at output time
 
-The prior coupled approach (MSE on state*power) caused gradient killing:
-when BCE pushed state->0, d(MSE)/d(power) = state * grad ≈ 0, deadlocking both heads.
+Key design choices vs prior versions:
+  - Softplus (not ReLU) for power head: no dead-neuron risk
+  - Masked MSE: power head learns conditional mean E[P|ON], not unconditional mean
+  - BCE from epoch 1: state head gets immediate supervision (not cold at epoch 21)
+  - Physics warmup: physics penalty added only after WARMUP_EPOCHS
 
 Loss:
-    Stage 1 (epochs 1-WARMUP_EPOCHS): MSE only (on pred_power)
-    Stage 2 (remaining epochs):       MSE(pred_power) + lambda * HuberPhys(gated) + weighted BCE(state)
+    Stage 1 (epochs 1-WARMUP_EPOCHS): MaskedMSE(pred_power) + weighted BCE(state)
+    Stage 2 (remaining epochs):       MaskedMSE + lambda * HuberPhys(gated) + BCE
 
 Physics constraint (Huber-style, active-power channel only):
     violation = ReLU(sum_i p_hat_i_gated_raw - P_agg_raw - epsilon)
@@ -197,7 +200,8 @@ class PhysicsInformedDualHeadLiquidNetworkModel(nn.Module):
 
         h = self.norm(h)
 
-        power = torch.cat([F.relu(head(h))        for head in self.power_heads], dim=1)
+        # Softplus: always positive, never dead-neuron (unlike ReLU)
+        power = torch.cat([F.softplus(head(h))    for head in self.power_heads], dim=1)
         state = torch.cat([torch.sigmoid(head(h)) for head in self.state_heads], dim=1)
         return power, state
 
@@ -335,7 +339,6 @@ def train_pinn_model(data_dict, save_dir,
         n_appliances=len(APPLIANCES), dt=dt,
     ).to(device)
 
-    mse_criterion  = nn.MSELoss()
     phys_criterion = PhysicsConsistencyLoss(
         x_scalers[0], y_scalers, APPLIANCES,
         epsilon_w=epsilon_w, huber_delta=huber_delta,
@@ -367,29 +370,37 @@ def train_pinn_model(data_dict, save_dir,
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
 
-            # Decoupled: forward returns raw power + state separately (no multiplication)
             pred_power, pred_state = model(xb)
-            pred_gated = pred_state * pred_power   # used only for physics loss
+            pred_gated = pred_state * pred_power   # gated output for physics + inference
 
-            # MSE directly on power head -- always has clean gradients regardless of state
-            mse_loss  = mse_criterion(pred_power, yb)
+            # Masked MSE: supervise power head only on ON samples so it learns E[P | ON]
+            on_masks   = torch.stack(
+                [(yb[:, i] > thresholds_scaled[i]) for i in range(len(APPLIANCES))],
+                dim=1
+            ).float()                                          # (batch, n_apps)
+            masked_sq  = (pred_power - yb) ** 2 * on_masks
+            n_on       = on_masks.sum(dim=0).clamp(min=1.0)   # (n_apps,)
+            mse_loss   = (masked_sq.sum(dim=0) / n_on).mean()
+
             x_mid     = xb[:, WIN // 2, 0]
             phys_loss = phys_criterion(x_mid, pred_gated)
 
+            # BCE from epoch 1 -- state head trained from the very start
+            bce_loss = torch.tensor(0.0, device=device)
+            for i, app in enumerate(APPLIANCES):
+                if BCE_LAMBDA[app] > 0:
+                    state_i = pred_state[:, i].clamp(1e-7, 1 - 1e-7)
+                    y_bin   = on_masks[:, i]
+                    w       = torch.where(y_bin == 1,
+                                          torch.full_like(y_bin, BCE_ALPHA[app]),
+                                          torch.full_like(y_bin, BCE_BETA[app]))
+                    bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
+                        state_i, y_bin, weight=w)
+
+            # Physics penalty added only after warmup
             if epoch < WARMUP_EPOCHS:
-                loss = mse_loss
+                loss = mse_loss + bce_loss
             else:
-                bce_loss = torch.tensor(0.0, device=device)
-                for i, app in enumerate(APPLIANCES):
-                    if BCE_LAMBDA[app] > 0:
-                        state_i = pred_state[:, i].clamp(1e-7, 1 - 1e-7)
-                        thr_s   = thresholds_scaled[i]
-                        y_bin   = (yb[:, i] > thr_s).float()
-                        w       = torch.where(y_bin == 1,
-                                              torch.full_like(y_bin, BCE_ALPHA[app]),
-                                              torch.full_like(y_bin, BCE_BETA[app]))
-                        bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
-                            state_i, y_bin, weight=w)
                 loss = mse_loss + lambda_phys * phys_loss + bce_loss
 
             loss.backward()
@@ -417,11 +428,18 @@ def train_pinn_model(data_dict, save_dir,
 
         with torch.no_grad():
             for xb, yb in va_loader:
-                xb, yb          = xb.to(device), yb.to(device)
+                xb, yb               = xb.to(device), yb.to(device)
                 pred_power, pred_state = model(xb)
-                pred_gated      = pred_state * pred_power   # gated inference output
+                pred_gated           = pred_state * pred_power
 
-                mse_loss  = mse_criterion(pred_power, yb)
+                on_masks_v  = torch.stack(
+                    [(yb[:, i] > thresholds_scaled[i]) for i in range(len(APPLIANCES))],
+                    dim=1
+                ).float()
+                masked_sq_v = (pred_power - yb) ** 2 * on_masks_v
+                n_on_v      = on_masks_v.sum(dim=0).clamp(min=1.0)
+                mse_loss    = (masked_sq_v.sum(dim=0) / n_on_v).mean()
+
                 x_mid     = xb[:, WIN // 2, 0]
                 phys_loss = phys_criterion(x_mid, pred_gated)
                 loss      = mse_loss + lambda_phys * phys_loss
