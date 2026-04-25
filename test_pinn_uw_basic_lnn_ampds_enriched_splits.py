@@ -17,6 +17,10 @@ Loss formulation (stage 2, post-warmup):
 During warmup (epochs 1..WARMUP_EPOCHS):  only L_MSE (no weighting).
 After warmup:  uncertainty-weighted MSE + Phys + BCE.
 
+To prevent gradient shock at the warmup→stage2 boundary, log_var is
+initialised to [0.0, 3.0, 4.0] so phys/BCE start at precision ~0.05/0.018.
+UW parameters use LR*10 so they track the loss balance quickly.
+
 Architecture: same BasicLNN as base script.
 """
 
@@ -94,10 +98,17 @@ class UncertaintyWeighting(nn.Module):
     acts as a regulariser that prevents sigma from collapsing to infinity.
     """
 
-    def __init__(self, n_tasks: int = 3):
+    def __init__(self, n_tasks: int = 3,
+                 init_log_var: list | None = None):
         super().__init__()
-        # log(sigma^2); initialised to 0 (sigma = 1, weight = 0.5)
-        self.log_var = nn.Parameter(torch.zeros(n_tasks))
+        # log(sigma^2); default 0 => sigma=1, weight=0.5
+        # Pass higher init values to start a task heavily down-weighted
+        if init_log_var is not None:
+            assert len(init_log_var) == n_tasks
+            init = torch.tensor(init_log_var, dtype=torch.float32)
+        else:
+            init = torch.zeros(n_tasks)
+        self.log_var = nn.Parameter(init)
 
     def forward(self, *losses):
         """
@@ -331,16 +342,24 @@ def train_pinn_model(data_dict, save_dir,
     ).to(device)
 
     # ── Uncertainty weighting: 3 tasks (mse, phys, bce) ──
-    uw = UncertaintyWeighting(n_tasks=3).to(device)
+    # Phys and BCE start heavily down-weighted (log_var >> 0 => precision << 1)
+    # so the hard warmup→stage2 transition doesn't cause gradient shock.
+    # They will be tuned upward/downward from there as training proceeds.
+    uw = UncertaintyWeighting(
+        n_tasks=3, init_log_var=[0.0, 3.0, 4.0]
+    ).to(device)
 
     mse_criterion  = nn.MSELoss()
     phys_criterion = PhysicsConsistencyLoss(
         x_scalers[0], y_scalers, APPLIANCES, epsilon_w=epsilon_w
     ).to(device)
 
-    # Both model and uw parameters are optimised together
-    optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(uw.parameters()), lr=LR)
+    # UW log_var params use 10x LR so they adapt fast enough to steer
+    # loss balance across the warmup->stage2 transition.
+    optimizer = torch.optim.Adam([
+        {'params': model.parameters(), 'lr': LR},
+        {'params': uw.parameters(),    'lr': LR * 10},
+    ])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=8, min_lr=1e-5)
 
