@@ -103,7 +103,9 @@ class UncertaintyWeighting(nn.Module):
     """
 
     def __init__(self, n_tasks: int = 3,
-                 init_log_var: list | None = None):
+                 init_log_var: list | None = None,
+                 clamp_lo: list | None = None,
+                 clamp_hi: list | None = None):
         super().__init__()
         # log(sigma^2); default 0 => sigma=1, weight=0.5
         # Pass higher init values to start a task heavily down-weighted
@@ -113,22 +115,28 @@ class UncertaintyWeighting(nn.Module):
         else:
             init = torch.zeros(n_tasks)
         self.log_var = nn.Parameter(init)
+        # Per-task clamp bounds (lists of length n_tasks or None for uniform)
+        self.clamp_lo = clamp_lo if clamp_lo is not None else [-3.0] * n_tasks
+        self.clamp_hi = clamp_hi if clamp_hi is not None else [ 6.0] * n_tasks
 
     def forward(self, *losses):
         """
         losses: sequence of scalar tensors, one per task.
         Returns: total weighted loss, list of per-task precision weights.
 
-        log_var is clamped to [-3, 6]:
-          lower bound: prevents MSE precision from exploding (cap at exp(3)≈20)
-          upper bound: prevents phys/BCE/FP from vanishing entirely (floor at exp(-6)≈0.002)
+        Per-task clamp bounds on log_var:
+          MSE lower = -3  => precision cap exp(3)≈20×
+          FP/phys/BCE lower = -1  => precision cap exp(1)≈2.7×
+            prevents FP from fighting MSE at equal strength,
+            which caused heat pump recall collapse in earlier runs.
+          Upper = 6 for all => precision floor exp(-6)≈0.002 (never fully silent)
         """
         assert len(losses) == self.log_var.numel(), \
             f"Expected {self.log_var.numel()} losses, got {len(losses)}"
         total = torch.tensor(0.0, device=self.log_var.device)
         precisions = []
         for i, loss_i in enumerate(losses):
-            s_i        = self.log_var[i].clamp(-3.0, 6.0)
+            s_i        = self.log_var[i].clamp(self.clamp_lo[i], self.clamp_hi[i])
             precision  = torch.exp(-s_i)          # 1 / sigma_i^2
             weighted   = 0.5 * precision * loss_i + 0.5 * s_i
             total      = total + weighted
@@ -350,10 +358,17 @@ def train_pinn_model(data_dict, save_dir,
     ).to(device)
 
     # ── Uncertainty weighting: 4 tasks (mse, phys, bce, fp) ──
-    # Phys/BCE/FP start heavily down-weighted so the warmup→stage2
-    # transition doesn't cause gradient shock; UW tunes from there.
+    # Phys/BCE/FP start heavily down-weighted (log_var >> 0) so the
+    # warmup→stage2 transition doesn't cause gradient shock.
+    # Per-task lower clamps:
+    #   MSE: -3 => precision cap ≈20×
+    #   Phys/BCE/FP: -1 => precision cap ≈2.7× (prevents FP from
+    #     overwhelming MSE and collapsing heat pump recall)
     uw = UncertaintyWeighting(
-        n_tasks=4, init_log_var=[0.0, 3.0, 4.0, 2.0]
+        n_tasks=4,
+        init_log_var=[0.0,  3.0,  4.0,  2.0],
+        clamp_lo    =[-3.0, -1.0, -1.0, -1.0],
+        clamp_hi    =[ 6.0,  6.0,  6.0,  6.0],
     ).to(device)
 
     mse_criterion  = nn.MSELoss()
@@ -520,8 +535,10 @@ def train_pinn_model(data_dict, save_dir,
         avg_mae = np.mean([per_app_metrics[a]['mae'] for a in APPLIANCES])
 
         # Compute effective weights = exp(-log_var) for display
-        # (clamp mirrors the forward clamp so display is consistent)
-        lv_clamped = [max(-3.0, min(6.0, v)) for v in lv]
+        # (clamp mirrors per-task forward clamps so display is consistent)
+        lo = uw.clamp_lo
+        hi = uw.clamp_hi
+        lv_clamped = [max(lo[i], min(hi[i], lv[i])) for i in range(len(lv))]
         sig_mse  = np.exp(-lv_clamped[0])
         sig_phys = np.exp(-lv_clamped[1])
         sig_bce  = np.exp(-lv_clamped[2])
@@ -544,6 +561,14 @@ def train_pinn_model(data_dict, save_dir,
             print(f"    {app:<14}  F1={m['f1']:.4f}  "
                   f"P={m['precision']:.4f}  R={m['recall']:.4f}  "
                   f"MAE={m['mae']:.2f}  SAE={m['sae']:.4f}")
+
+        # Reset model selection at the warmup→stage2 boundary so the
+        # saved best state is guaranteed to come from the FP-aware regime.
+        if epoch + 1 == WARMUP_EPOCHS:
+            best_val_loss = float('inf')
+            counter       = 0
+            print(f"  [Warmup end] Model selection reset — "
+                  f"stage-2 FP-aware training begins.")
 
         if avg_va_mse < best_val_loss:
             best_val_loss = avg_va_mse
@@ -586,7 +611,9 @@ def train_pinn_model(data_dict, save_dir,
 
     # ── Final learned uncertainty parameters ──
     final_lv = uw.log_var.detach().cpu().tolist()
-    final_lv_c = [max(-3.0, min(6.0, v)) for v in final_lv]
+    lo = uw.clamp_lo
+    hi = uw.clamp_hi
+    final_lv_c = [max(lo[i], min(hi[i], final_lv[i])) for i in range(len(final_lv))]
     print(f"\nFinal learned log_var: mse={final_lv[0]:.4f}  "
           f"phys={final_lv[1]:.4f}  bce={final_lv[2]:.4f}  fp={final_lv[3]:.4f}")
     print(f"  => effective precision (1/sigma^2): "
@@ -672,8 +699,11 @@ def _plot_training(history, test_metrics, save_dir):
     axes[3].set_xlabel('Epoch'); axes[3].set_ylabel('L_fp')
     axes[3].legend(); axes[3].grid(True, alpha=0.3)
 
-    # Uncertainty log_var evolution (clamped for display)
-    log_var_arr = np.clip(np.array(history['log_var']), -3.0, 6.0)  # (epochs, 4)
+    # Uncertainty log_var evolution (clamped per-task for display)
+    lv_raw = np.array(history['log_var'])                            # (epochs, 4)
+    lo_arr = np.array([-3.0, -1.0, -1.0, -1.0])
+    hi_arr = np.array([ 6.0,  6.0,  6.0,  6.0])
+    log_var_arr = np.clip(lv_raw, lo_arr, hi_arr)
     axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 0]), label='1/sigma^2 MSE',  color='blue')
     axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 1]), label='1/sigma^2 Phys', color='orange')
     axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 2]), label='1/sigma^2 BCE',  color='green')
