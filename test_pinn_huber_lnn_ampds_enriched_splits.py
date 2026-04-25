@@ -74,6 +74,13 @@ BCE_ALPHA = {
     'heat pump':    5.0,
 }
 
+BCE_BETA = {                 # weight for OFF class -- penalises false positives
+    'dish washer':  3.0,
+    'fridge':       2.0,
+    'basement':     5.0,
+    'heat pump':    1.0,
+}
+
 
 # ---------------------------------------------------------------------------
 # Physics Consistency Loss  (Huber-style, active-power channel only)
@@ -349,7 +356,7 @@ def train_pinn_model(data_dict, save_dir,
                         y_bin  = (yb[:, i] > thr_s).float()
                         w      = torch.where(y_bin == 1,
                                              torch.full_like(y_bin, BCE_ALPHA[app]),
-                                             torch.ones_like(y_bin))
+                                             torch.full_like(y_bin, BCE_BETA[app]))
                         bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                             pred_i, y_bin, weight=w)
                 loss = mse_loss + lambda_phys * phys_loss + bce_loss
@@ -464,7 +471,7 @@ def train_pinn_model(data_dict, save_dir,
     config = {
         'dataset':     'AMPds_enriched',
         'model':       'PhysicsInformedBasicLiquidNetworkModel',
-        'description': 'basic LNN (fixed tau) + per-appliance heads + Huber L_phys, input=[P,Q]',
+        'description': 'basic LNN (fixed tau) + per-appliance heads + Huber L_phys + BCE_BETA FP penalty, input=[P,Q]',
         'loss':        (f'MSE + {lambda_phys} * HuberPhysicsConsistency'
                         f'(epsilon={epsilon_w}W, delta={huber_delta}W) [stage2 only]'),
         'input_size':  INPUT_SIZE,
