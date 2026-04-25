@@ -88,6 +88,7 @@ STRIDE          = 5
 INPUT_SIZE      = 2        # main (W)  +  main_Q (VAR)
 
 LAMBDA_PHYS     = 0.01
+BCE_BETA        = 0.01   # global BCE scale (analogous to LAMBDA_PHYS); keeps BCE ≈ MSE magnitude
 EPSILON_W       = 50.0
 WARMUP_EPOCHS   = 20
 BCE_RAMP_EPOCHS = 10   # ramp BCE from 0→1 over this many epochs after warmup
@@ -319,11 +320,11 @@ def compute_per_appliance_metrics(y_true, y_pred, y_scalers):
 
 def train_pinn_model(data_dict, save_dir,
                      hidden_size=64, bottleneck_size=BOTTLENECK_SIZE, dt=0.1,
-                     lambda_phys=LAMBDA_PHYS, epsilon_w=EPSILON_W):
+                     lambda_phys=LAMBDA_PHYS, bce_beta=BCE_BETA, epsilon_w=EPSILON_W):
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"lambda_phys={lambda_phys}  epsilon={epsilon_w} W  "
+    print(f"lambda_phys={lambda_phys}  bce_beta={bce_beta}  epsilon={epsilon_w} W  "
           f"hidden={hidden_size}  bottleneck={bottleneck_size}  dt={dt}")
 
     # ── Sequences ──
@@ -428,7 +429,7 @@ def train_pinn_model(data_dict, save_dir,
                                              torch.ones_like(y_bin))
                         bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                             pred_i, y_bin, weight=w)
-                loss = mse_loss + lambda_phys * phys_loss + bce_scale * bce_loss
+                loss = mse_loss + lambda_phys * phys_loss + bce_beta * bce_scale * bce_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -561,8 +562,8 @@ def train_pinn_model(data_dict, save_dir,
             'BasicLNN + shared bottleneck (hidden→bottleneck→GELU→LN) '
             '+ per-appliance projection heads + L_phys, input=[P,Q]'),
         'loss':        (
-            f'MSE + {lambda_phys} * PhysicsConsistency(epsilon={epsilon_w}W) '
-            '[stage2 only]'),
+            f'MSE + {lambda_phys}*L_phys + {bce_beta}*bce_scale*BCE '
+            f'[stage2, bce_scale ramp over {BCE_RAMP_EPOCHS} epochs, epsilon={epsilon_w}W]'),
         'architecture': {
             'encoder':    'BasicLNN (fixed tau, no gate)',
             'bottleneck': f'Linear({hidden_size}→{bottleneck_size}) + GELU + LN',
@@ -579,8 +580,9 @@ def train_pinn_model(data_dict, save_dir,
         },
         'train_params': {
             'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
-            'lambda_phys': lambda_phys, 'epsilon_w': epsilon_w,
-            'warmup_epochs': WARMUP_EPOCHS,
+            'lambda_phys': lambda_phys, 'bce_beta': bce_beta,
+            'epsilon_w': epsilon_w,
+            'warmup_epochs': WARMUP_EPOCHS, 'bce_ramp_epochs': BCE_RAMP_EPOCHS,
         },
         'test_metrics': {
             app: {k: float(v) for k, v in m.items()}
@@ -686,6 +688,7 @@ if __name__ == "__main__":
         bottleneck_size = BOTTLENECK_SIZE,
         dt              = 0.1,
         lambda_phys     = LAMBDA_PHYS,
+        bce_beta        = BCE_BETA,
         epsilon_w       = EPSILON_W,
     )
 
