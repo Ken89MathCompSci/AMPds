@@ -12,10 +12,14 @@ Loss formulation (stage 2, post-warmup):
     s_i = log(sigma_i^2)    -- learnable log-variance per loss component
     L_total = sum_i [ 0.5 * exp(-s_i) * L_i  +  0.5 * s_i ]
 
-    where i in {mse, phys, bce}
+    where i in {mse, phys, bce, fp}
 
 During warmup (epochs 1..WARMUP_EPOCHS):  only L_MSE (no weighting).
-After warmup:  uncertainty-weighted MSE + Phys + BCE.
+After warmup:  uncertainty-weighted MSE + Phys + BCE + FP.
+
+FP loss: mean squared prediction over OFF-state windows, averaged across
+appliances.  Directly penalises predicting "ON" when ground truth is "OFF"
+to address the high-recall / low-precision failure mode.
 
 To prevent gradient shock at the warmup→stage2 boundary, log_var is
 initialised to [0.0, 3.0, 4.0] so phys/BCE start at precision ~0.05/0.018.
@@ -114,13 +118,17 @@ class UncertaintyWeighting(nn.Module):
         """
         losses: sequence of scalar tensors, one per task.
         Returns: total weighted loss, list of per-task precision weights.
+
+        log_var is clamped to [-3, 6]:
+          lower bound: prevents MSE precision from exploding (cap at exp(3)≈20)
+          upper bound: prevents phys/BCE/FP from vanishing entirely (floor at exp(-6)≈0.002)
         """
         assert len(losses) == self.log_var.numel(), \
             f"Expected {self.log_var.numel()} losses, got {len(losses)}"
         total = torch.tensor(0.0, device=self.log_var.device)
         precisions = []
         for i, loss_i in enumerate(losses):
-            s_i        = self.log_var[i]
+            s_i        = self.log_var[i].clamp(-3.0, 6.0)
             precision  = torch.exp(-s_i)          # 1 / sigma_i^2
             weighted   = 0.5 * precision * loss_i + 0.5 * s_i
             total      = total + weighted
@@ -341,12 +349,11 @@ def train_pinn_model(data_dict, save_dir,
         n_appliances=len(APPLIANCES), dt=dt,
     ).to(device)
 
-    # ── Uncertainty weighting: 3 tasks (mse, phys, bce) ──
-    # Phys and BCE start heavily down-weighted (log_var >> 0 => precision << 1)
-    # so the hard warmup→stage2 transition doesn't cause gradient shock.
-    # They will be tuned upward/downward from there as training proceeds.
+    # ── Uncertainty weighting: 4 tasks (mse, phys, bce, fp) ──
+    # Phys/BCE/FP start heavily down-weighted so the warmup→stage2
+    # transition doesn't cause gradient shock; UW tunes from there.
     uw = UncertaintyWeighting(
-        n_tasks=3, init_log_var=[0.0, 3.0, 4.0]
+        n_tasks=4, init_log_var=[0.0, 3.0, 4.0, 2.0]
     ).to(device)
 
     mse_criterion  = nn.MSELoss()
@@ -364,9 +371,9 @@ def train_pinn_model(data_dict, save_dir,
         optimizer, mode='min', factor=0.5, patience=8, min_lr=1e-5)
 
     history = {
-        'train_loss': [], 'train_mse': [], 'train_phys': [],
-        'val_loss':   [], 'val_mse':   [], 'val_phys':   [],
-        # log_var history: shape (epochs, 3) -> [mse, phys, bce]
+        'train_loss': [], 'train_mse': [], 'train_phys': [], 'train_fp': [],
+        'val_loss':   [], 'val_mse':   [], 'val_phys':   [], 'val_fp':   [],
+        # log_var history: shape (epochs, 4) -> [mse, phys, bce, fp]
         'log_var':    [],
         'val_metrics': [],
     }
@@ -376,14 +383,14 @@ def train_pinn_model(data_dict, save_dir,
 
     n_params = (sum(p.numel() for p in model.parameters() if p.requires_grad)
                 + sum(p.numel() for p in uw.parameters()))
-    print(f"Model parameters: {n_params:,}  (includes 3 uncertainty log-var params)")
+    print(f"Model parameters: {n_params:,}  (includes 4 uncertainty log-var params)")
     print("Starting PINN-UW-BasicLNN training...")
 
     for epoch in range(EPOCHS):
         # ── Training ──
         model.train()
         uw.train()
-        ep_mse = ep_phys = ep_total = 0.0
+        ep_mse = ep_phys = ep_fp = ep_total = 0.0
         progress_bar = tqdm(tr_loader,
                             desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False)
         for xb, yb in progress_bar:
@@ -398,22 +405,28 @@ def train_pinn_model(data_dict, save_dir,
 
             if epoch < WARMUP_EPOCHS:
                 # Stage 1: plain MSE (uncertainty weights not yet involved)
-                loss = mse_loss
+                loss    = mse_loss
+                fp_loss = torch.tensor(0.0, device=device)
             else:
-                # Stage 2: uncertainty-weighted MSE + Phys + BCE
+                # Stage 2: uncertainty-weighted MSE + Phys + BCE + FP
                 bce_loss = torch.tensor(0.0, device=device)
+                fp_loss  = torch.tensor(0.0, device=device)
                 for i, app in enumerate(APPLIANCES):
+                    thr_s    = thresholds_scaled[i]
+                    off_mask = yb[:, i] <= thr_s
+                    if off_mask.any():
+                        fp_loss = fp_loss + (pred[:, i][off_mask].clamp(min=0) ** 2).mean()
                     if BCE_LAMBDA[app] > 0:
                         pred_i = pred[:, i].clamp(1e-7, 1 - 1e-7)
-                        thr_s  = thresholds_scaled[i]
                         y_bin  = (yb[:, i] > thr_s).float()
                         w      = torch.where(y_bin == 1,
                                              torch.full_like(y_bin, BCE_ALPHA[app]),
                                              torch.ones_like(y_bin))
                         bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                             pred_i, y_bin, weight=w)
+                fp_loss = fp_loss / len(APPLIANCES)
 
-                loss, _ = uw(mse_loss, phys_loss, bce_loss)
+                loss, _ = uw(mse_loss, phys_loss, bce_loss, fp_loss)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -421,17 +434,21 @@ def train_pinn_model(data_dict, save_dir,
 
             ep_mse   += mse_loss.item()
             ep_phys  += phys_loss.item()
+            ep_fp    += fp_loss.item()
             ep_total += loss.item()
             progress_bar.set_postfix({
                 'mse':  f'{mse_loss.item():.5f}',
                 'phys': f'{phys_loss.item():.5f}',
+                'fp':   f'{fp_loss.item():.5f}',
             })
 
         avg_tr_mse   = ep_mse   / len(tr_loader)
         avg_tr_phys  = ep_phys  / len(tr_loader)
+        avg_tr_fp    = ep_fp    / len(tr_loader)
         avg_tr_total = ep_total / len(tr_loader)
         history['train_mse'].append(avg_tr_mse)
         history['train_phys'].append(avg_tr_phys)
+        history['train_fp'].append(avg_tr_fp)
         history['train_loss'].append(avg_tr_total)
 
         # record current log_var values
@@ -441,7 +458,7 @@ def train_pinn_model(data_dict, save_dir,
         # ── Validation ──
         model.eval()
         uw.eval()
-        vl_mse = vl_phys = vl_total = 0.0
+        vl_mse = vl_phys = vl_fp = vl_total = 0.0
         val_preds, val_trues = [], []
 
         with torch.no_grad():
@@ -455,31 +472,40 @@ def train_pinn_model(data_dict, save_dir,
                 # val loss: weighted combination (or plain MSE during warmup)
                 if epoch < WARMUP_EPOCHS:
                     val_loss = mse_loss
+                    fp_loss  = torch.tensor(0.0, device=device)
                 else:
                     bce_loss = torch.tensor(0.0, device=device)
+                    fp_loss  = torch.tensor(0.0, device=device)
                     for i, app in enumerate(APPLIANCES):
+                        thr_s    = thresholds_scaled[i]
+                        off_mask = yb[:, i] <= thr_s
+                        if off_mask.any():
+                            fp_loss = fp_loss + (pred[:, i][off_mask].clamp(min=0) ** 2).mean()
                         if BCE_LAMBDA[app] > 0:
                             pred_i = pred[:, i].clamp(1e-7, 1 - 1e-7)
-                            thr_s  = thresholds_scaled[i]
                             y_bin  = (yb[:, i] > thr_s).float()
                             w      = torch.where(y_bin == 1,
                                                  torch.full_like(y_bin, BCE_ALPHA[app]),
                                                  torch.ones_like(y_bin))
                             bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                                 pred_i, y_bin, weight=w)
-                    val_loss, _ = uw(mse_loss, phys_loss, bce_loss)
+                    fp_loss  = fp_loss / len(APPLIANCES)
+                    val_loss, _ = uw(mse_loss, phys_loss, bce_loss, fp_loss)
 
                 vl_mse   += mse_loss.item()
                 vl_phys  += phys_loss.item()
+                vl_fp    += fp_loss.item()
                 vl_total += val_loss.item()
                 val_preds.append(pred.cpu().numpy())
                 val_trues.append(yb.cpu().numpy())
 
         avg_va_mse   = vl_mse   / len(va_loader)
         avg_va_phys  = vl_phys  / len(va_loader)
+        avg_va_fp    = vl_fp    / len(va_loader)
         avg_va_total = vl_total / len(va_loader)
         history['val_mse'].append(avg_va_mse)
         history['val_phys'].append(avg_va_phys)
+        history['val_fp'].append(avg_va_fp)
         history['val_loss'].append(avg_va_total)
 
         scheduler.step(avg_va_mse)
@@ -494,21 +520,24 @@ def train_pinn_model(data_dict, save_dir,
         avg_mae = np.mean([per_app_metrics[a]['mae'] for a in APPLIANCES])
 
         # Compute effective weights = exp(-log_var) for display
-        sig_mse  = np.exp(-lv[0])
-        sig_phys = np.exp(-lv[1])
-        sig_bce  = np.exp(-lv[2])
+        # (clamp mirrors the forward clamp so display is consistent)
+        lv_clamped = [max(-3.0, min(6.0, v)) for v in lv]
+        sig_mse  = np.exp(-lv_clamped[0])
+        sig_phys = np.exp(-lv_clamped[1])
+        sig_bce  = np.exp(-lv_clamped[2])
+        sig_fp   = np.exp(-lv_clamped[3])
 
         print(
             f"  Epoch {epoch+1:3d}/{EPOCHS}  "
-            f"train={avg_tr_total:.5f} (mse={avg_tr_mse:.5f} phys={avg_tr_phys:.5f})  "
-            f"val={avg_va_total:.5f} (mse={avg_va_mse:.5f} phys={avg_va_phys:.5f})  "
+            f"train={avg_tr_total:.5f} (mse={avg_tr_mse:.5f} phys={avg_tr_phys:.5f} fp={avg_tr_fp:.5f})  "
+            f"val={avg_va_total:.5f} (mse={avg_va_mse:.5f} phys={avg_va_phys:.5f} fp={avg_va_fp:.5f})  "
             f"avgF1={avg_f1:.4f}  avgMAE={avg_mae:.2f}  "
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
         print(
             f"    UW precisions (1/sigma^2):  "
-            f"mse={sig_mse:.4f}  phys={sig_phys:.4f}  bce={sig_bce:.4f}  "
-            f"[log_var: {lv[0]:.3f} {lv[1]:.3f} {lv[2]:.3f}]"
+            f"mse={sig_mse:.4f}  phys={sig_phys:.4f}  bce={sig_bce:.4f}  fp={sig_fp:.4f}  "
+            f"[log_var: {lv[0]:.3f} {lv[1]:.3f} {lv[2]:.3f} {lv[3]:.3f}]"
         )
         for app in APPLIANCES:
             m = per_app_metrics[app]
@@ -557,12 +586,14 @@ def train_pinn_model(data_dict, save_dir,
 
     # ── Final learned uncertainty parameters ──
     final_lv = uw.log_var.detach().cpu().tolist()
+    final_lv_c = [max(-3.0, min(6.0, v)) for v in final_lv]
     print(f"\nFinal learned log_var: mse={final_lv[0]:.4f}  "
-          f"phys={final_lv[1]:.4f}  bce={final_lv[2]:.4f}")
+          f"phys={final_lv[1]:.4f}  bce={final_lv[2]:.4f}  fp={final_lv[3]:.4f}")
     print(f"  => effective precision (1/sigma^2): "
-          f"mse={np.exp(-final_lv[0]):.4f}  "
-          f"phys={np.exp(-final_lv[1]):.4f}  "
-          f"bce={np.exp(-final_lv[2]):.4f}")
+          f"mse={np.exp(-final_lv_c[0]):.4f}  "
+          f"phys={np.exp(-final_lv_c[1]):.4f}  "
+          f"bce={np.exp(-final_lv_c[2]):.4f}  "
+          f"fp={np.exp(-final_lv_c[3]):.4f}")
 
     # ── Save JSON ──
     config = {
@@ -570,9 +601,9 @@ def train_pinn_model(data_dict, save_dir,
         'model':       'PhysicsInformedBasicLiquidNetworkModel',
         'description': (
             'basic LNN (fixed tau, no gate) + per-appliance heads + '
-            'Kendall uncertainty-weighted losses (MSE, Phys, BCE)'),
+            'Kendall uncertainty-weighted losses (MSE, Phys, BCE, FP)'),
         'loss':        (
-            'UW: 0.5*exp(-s_i)*L_i + 0.5*s_i  for i in {mse, phys, bce} '
+            'UW: 0.5*exp(-s_i)*L_i + 0.5*s_i  for i in {mse, phys, bce, fp} '
             f'[warmup {WARMUP_EPOCHS} epochs: plain MSE]'),
         'input_size':  INPUT_SIZE,
         'window_size': WIN,
@@ -588,11 +619,13 @@ def train_pinn_model(data_dict, save_dir,
             'mse':  final_lv[0],
             'phys': final_lv[1],
             'bce':  final_lv[2],
+            'fp':   final_lv[3],
         },
         'final_precision_1_over_sigma2': {
-            'mse':  float(np.exp(-final_lv[0])),
-            'phys': float(np.exp(-final_lv[1])),
-            'bce':  float(np.exp(-final_lv[2])),
+            'mse':  float(np.exp(-final_lv_c[0])),
+            'phys': float(np.exp(-final_lv_c[1])),
+            'bce':  float(np.exp(-final_lv_c[2])),
+            'fp':   float(np.exp(-final_lv_c[3])),
         },
         'test_metrics': {
             app: {k: float(v) for k, v in m.items()}
@@ -613,7 +646,7 @@ def train_pinn_model(data_dict, save_dir,
 def _plot_training(history, test_metrics, save_dir):
     epochs_x = range(1, len(history['train_loss']) + 1)
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    fig, axes = plt.subplots(1, 5, figsize=(25, 4))
 
     axes[0].plot(epochs_x, history['train_loss'], label='Train total', color='blue')
     axes[0].plot(epochs_x, history['val_loss'],   label='Val total',   color='red')
@@ -633,16 +666,23 @@ def _plot_training(history, test_metrics, save_dir):
     axes[2].set_xlabel('Epoch'); axes[2].set_ylabel('L_phys')
     axes[2].legend(); axes[2].grid(True, alpha=0.3)
 
-    # Uncertainty log_var evolution
-    log_var_arr = np.array(history['log_var'])   # (epochs, 3)
-    axes[3].plot(epochs_x, np.exp(-log_var_arr[:, 0]), label='1/sigma^2 MSE',  color='blue')
-    axes[3].plot(epochs_x, np.exp(-log_var_arr[:, 1]), label='1/sigma^2 Phys', color='orange')
-    axes[3].plot(epochs_x, np.exp(-log_var_arr[:, 2]), label='1/sigma^2 BCE',  color='green')
-    axes[3].axvline(WARMUP_EPOCHS, color='grey', linestyle='--', alpha=0.6,
-                    label=f'Warmup end (ep {WARMUP_EPOCHS})')
-    axes[3].set_title('Learned Precisions (1/sigma^2)')
-    axes[3].set_xlabel('Epoch'); axes[3].set_ylabel('Precision weight')
+    axes[3].plot(epochs_x, history['train_fp'], label='Train FP', color='blue')
+    axes[3].plot(epochs_x, history['val_fp'],   label='Val FP',   color='red')
+    axes[3].set_title('False Positive Loss')
+    axes[3].set_xlabel('Epoch'); axes[3].set_ylabel('L_fp')
     axes[3].legend(); axes[3].grid(True, alpha=0.3)
+
+    # Uncertainty log_var evolution (clamped for display)
+    log_var_arr = np.clip(np.array(history['log_var']), -3.0, 6.0)  # (epochs, 4)
+    axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 0]), label='1/sigma^2 MSE',  color='blue')
+    axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 1]), label='1/sigma^2 Phys', color='orange')
+    axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 2]), label='1/sigma^2 BCE',  color='green')
+    axes[4].plot(epochs_x, np.exp(-log_var_arr[:, 3]), label='1/sigma^2 FP',   color='purple')
+    axes[4].axvline(WARMUP_EPOCHS, color='grey', linestyle='--', alpha=0.6,
+                    label=f'Warmup end (ep {WARMUP_EPOCHS})')
+    axes[4].set_title('Learned Precisions (1/sigma^2)')
+    axes[4].set_xlabel('Epoch'); axes[4].set_ylabel('Precision weight')
+    axes[4].legend(); axes[4].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, 'pinn_uw_basic_lnn_ampds_enriched_loss.png'),
