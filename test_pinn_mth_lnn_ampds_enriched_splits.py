@@ -1,32 +1,58 @@
 """
-Physics-Informed Basic LNN with Softplus Physics Loss (PINN-SoftplusLNN)
-for NILM -- AMPds enriched splits (P + Q).
+Physics-Informed Multi-Task Head LNN (PINN-MTH-LNN) for NILM
+-- AMPds enriched splits (P + Q).
 
 Based on test_pinn_basic_lnn_ampds_enriched_splits.py.
 
-Key change: the physics consistency constraint replaces the hard ReLU with a
-differentiable Softplus (log-sum-exp) approximation:
+Key change: independent per-appliance Linear heads are replaced with a
+Physics-Informed Multi-Task Head structure:
 
-    ReLU (original):
-        L_phys = mean[ ReLU(p_sum - P_agg - epsilon) ]
-        Gradient = 0 when constraint is satisfied → dead zone
+    OLD architecture (independent heads):
+        LNN hidden  (batch, hidden)
+             |
+        LayerNorm(hidden)
+             |
+        ┌──────┬──────┬──────┬──────┐
+        │Linear│Linear│Linear│Linear│   -- 4 independent heads
+        └──────┴──────┴──────┴──────┘
+        output: (batch, 4)
 
-    Softplus (this script):
-        L_phys = mean[ softplus_beta(p_sum - P_agg - epsilon) ]
-               = mean[ (1/beta) * log(1 + exp(beta * (p_sum - P_agg - eps))) ]
-        Gradient = sigmoid(beta * (p_sum - P_agg - eps)) > 0 always
-                 → non-zero gradient even when constraint is satisfied,
-                   providing a continuous "pull" toward energy conservation.
+    NEW architecture (shared bottleneck + per-appliance projection):
+        LNN hidden  (batch, hidden)
+             |
+        LayerNorm(hidden)
+             |
+        Linear(hidden → bottleneck)          ← shared power-structure layer
+             |
+        GELU activation
+             |
+        LayerNorm(bottleneck)
+             |
+        ┌──────┬──────┬──────┬──────┐
+        │Linear│Linear│Linear│Linear│   -- 4 appliance-specific projections
+        └──────┴──────┴──────┴──────┘
+        output: (batch, 4)
 
-    As beta → ∞, softplus → ReLU.
-    Default beta=1.0 gives the smoothest gradient signal.
+Rationale:
+    Appliance power consumptions are rarely independent — the dishwasher,
+    fridge, basement and heat pump all share the same aggregated signal.
+    A shared bottleneck forces the model to first encode the "power
+    decomposition structure" of the aggregate before separating it per
+    appliance.  This inductive bias improves physical consistency across
+    outputs, as the bottleneck acts as a joint embedding of the load
+    signature rather than four separate regressions.
 
-Architecture: identical to base BasicLNN -- same BasicLiquidTimeLayer encoder
-    + per-appliance linear heads.  Only the physics loss activation changes.
+Architecture hyperparameter:
+    BOTTLENECK_SIZE  (default 32 = hidden_size // 2)
+    Smaller → more compression / shared representation
+    Larger  → closer to independent heads
 
-Loss (unchanged stage structure):
+Loss: identical to base script.
     Stage 1 (epochs 1-WARMUP_EPOCHS): MSE only
-    Stage 2 (remaining epochs):       MSE + lambda * L_phys_softplus + weighted BCE
+    Stage 2 (remaining epochs):       MSE + lambda * L_phys + weighted BCE
+
+Physics constraint (active-power only, channel 0):
+    ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon) = 0
 """
 
 import sys
@@ -50,21 +76,19 @@ from utils import calculate_nilm_metrics, save_model
 # Constants
 # ---------------------------------------------------------------------------
 
-EPOCHS        = 80
-PATIENCE      = 20
-LR            = 1e-3
-BATCH         = 32
-WIN           = 100
-STRIDE        = 5
-INPUT_SIZE    = 2        # main (W)  +  main_Q (VAR)
+EPOCHS          = 80
+PATIENCE        = 20
+LR              = 1e-3
+BATCH           = 32
+WIN             = 100
+STRIDE          = 5
+INPUT_SIZE      = 2        # main (W)  +  main_Q (VAR)
 
-LAMBDA_PHYS   = 0.01
-EPSILON_W     = 50.0
-WARMUP_EPOCHS = 20
+LAMBDA_PHYS     = 0.01
+EPSILON_W       = 50.0
+WARMUP_EPOCHS   = 20
 
-# Softplus sharpness: beta=1 (smooth) → beta=10 (near-ReLU)
-# A range of {0.5, 1.0, 2.0, 5.0} is worth comparing; default 1.0.
-SOFTPLUS_BETA = 1.0
+BOTTLENECK_SIZE = 32       # shared bottleneck width (hidden_size // 2 by default)
 
 DATA_DIR = 'data/AMPds_enriched_data'
 
@@ -93,32 +117,20 @@ BCE_ALPHA = {
 
 
 # ---------------------------------------------------------------------------
-# Physics Consistency Loss  (Softplus activation)
+# Physics Consistency Loss  (active-power channel only)
 # ---------------------------------------------------------------------------
 
 class PhysicsConsistencyLoss(nn.Module):
     """
-    Soft one-sided penalty using Softplus instead of ReLU:
-
-        L_phys = mean[ (1/beta) * log(1 + exp(beta*(p_sum_raw - P_agg_raw - eps))) ]
-
-    Gradient w.r.t. p_sum_raw:
-        dL/dp_sum = sigmoid(beta*(p_sum_raw - P_agg_raw - eps))
-
-    Unlike ReLU, this gradient is never exactly zero:
-        - When deeply satisfied (p_sum << P_agg): gradient ≈ exp(beta*excess) → tiny
-        - Near boundary:                          gradient ≈ 0.5 (sigmoid(0))
-        - When violated (p_sum >> P_agg):         gradient → 1
+    Soft one-sided penalty:  ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon)
 
     x_mid_scaled comes from channel 0 (active power P).
     x_scaler_P is the MinMaxScaler fitted on the P channel.
     """
 
-    def __init__(self, x_scaler_P, y_scalers, appliances,
-                 epsilon_w=EPSILON_W, beta=SOFTPLUS_BETA):
+    def __init__(self, x_scaler_P, y_scalers, appliances, epsilon_w=EPSILON_W):
         super().__init__()
         self.epsilon = epsilon_w
-        self.beta    = beta
 
         x_min   = float(x_scaler_P.data_min_[0])
         x_range = float(x_scaler_P.data_range_[0])
@@ -131,45 +143,61 @@ class PhysicsConsistencyLoss(nn.Module):
         self.register_buffer('y_ranges', torch.tensor(y_ranges, dtype=torch.float32))
 
     def forward(self, x_mid_scaled, pred_scaled):
-        x_raw  = x_mid_scaled * self.x_range + self.x_min   # (batch,)
-        p_raw  = pred_scaled  * self.y_ranges + self.y_mins  # (batch, n_apps)
-        p_sum  = p_raw.sum(dim=1)
-        # Softplus: smooth approximation to ReLU with non-zero gradient everywhere
-        penalty = F.softplus(p_sum - x_raw - self.epsilon, beta=self.beta)
-        return penalty.mean()
+        x_raw     = x_mid_scaled * self.x_range + self.x_min   # (batch,)
+        p_raw     = pred_scaled  * self.y_ranges + self.y_mins  # (batch, n_apps)
+        p_sum     = p_raw.sum(dim=1)
+        violation = F.relu(p_sum - x_raw - self.epsilon)
+        return violation.mean()
 
 
 # ---------------------------------------------------------------------------
-# Basic LNN Model (fixed tau, no gate)  -- identical to base script
+# Multi-Task Head LNN Model
 # ---------------------------------------------------------------------------
 
-class PhysicsInformedBasicLiquidNetworkModel(nn.Module):
+class PhysicsInformedMTHLiquidNetworkModel(nn.Module):
     """
-    Single BasicLiquidTimeLayer encoder -> per-appliance linear heads.
+    BasicLiquidTimeLayer encoder → shared bottleneck → per-appliance heads.
 
-    Cell update:
-        tau       = softplus(tau_param)          -- fixed, not input-dependent
-        f_t       = tanh(W_in*x_t + W_rec*h)
-        dh        = (-h / tau + f_t) * dt
-        h_new     = clamp(h + dh, -10, 10)
+    Cell update (identical to base BasicLNN):
+        tau   = softplus(tau_param)
+        f_t   = tanh(W_in*x_t + W_rec*h)
+        dh    = (-h / tau + f_t) * dt
+        h_new = clamp(h + dh, -10, 10)
+
+    Multi-task head block:
+        h  →  LayerNorm  →  Linear(hidden→bottleneck)  →  GELU
+           →  LayerNorm(bottleneck)
+           →  [Linear(bottleneck→1)] × n_appliances
+
+    The shared bottleneck compresses the hidden state into a joint
+    representation of the aggregate power structure, which is then
+    independently decoded by each appliance head.
     """
 
-    def __init__(self, input_size, hidden_size, n_appliances, dt=0.1):
+    def __init__(self, input_size, hidden_size, n_appliances,
+                 bottleneck_size=BOTTLENECK_SIZE, dt=0.1):
         super().__init__()
-        self.hidden_size  = hidden_size
-        self.n_appliances = n_appliances
-        self.dt           = dt
+        self.hidden_size     = hidden_size
+        self.n_appliances    = n_appliances
+        self.bottleneck_size = bottleneck_size
+        self.dt              = dt
 
+        # ── BasicLNN cell ──
         self.input_proj  = nn.Linear(input_size, hidden_size)
         self.tau         = nn.Parameter(torch.ones(hidden_size))
         self.rec_weights = nn.Parameter(torch.empty(hidden_size, hidden_size))
         nn.init.xavier_uniform_(self.rec_weights)
 
         self.intra_norm = nn.LayerNorm(hidden_size)
-        self.norm       = nn.LayerNorm(hidden_size)
+        self.norm       = nn.LayerNorm(hidden_size)       # post-LNN normalisation
 
+        # ── Shared bottleneck ──
+        self.shared_bottleneck = nn.Linear(hidden_size, bottleneck_size)
+        self.bottleneck_norm   = nn.LayerNorm(bottleneck_size)
+
+        # ── Per-appliance projection heads ──
         self.heads = nn.ModuleList([
-            nn.Linear(hidden_size, 1) for _ in range(n_appliances)
+            nn.Linear(bottleneck_size, 1) for _ in range(n_appliances)
         ])
 
     def forward(self, x):
@@ -186,8 +214,14 @@ class PhysicsInformedBasicLiquidNetworkModel(nn.Module):
             dh         = (-h / tau + f_t) * self.dt
             h          = (h + dh).clamp(-10.0, 10.0)
 
-        h = self.norm(h)
-        return torch.cat([head(h) for head in self.heads], dim=1)
+        h = self.norm(h)                                   # (batch, hidden)
+
+        # Shared bottleneck: compress to joint power-structure embedding
+        shared = F.gelu(self.bottleneck_norm(self.shared_bottleneck(h)))
+        # (batch, bottleneck_size)
+
+        # Per-appliance projections from shared embedding
+        return torch.cat([head(shared) for head in self.heads], dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +275,7 @@ def create_sequences(data, window_size=WIN):
 
 
 def _scale_X(X_tr, X_va, X_te):
-    """Per-channel MinMaxScaler on train."""
+    """Per-channel MinMaxScaler on train; returns scaled arrays + list of scalers."""
     n_tr, n_va, n_te = X_tr.shape[0], X_va.shape[0], X_te.shape[0]
     X_tr_n = X_tr.copy()
     X_va_n = X_va.copy()
@@ -280,16 +314,13 @@ def compute_per_appliance_metrics(y_true, y_pred, y_scalers):
 # ---------------------------------------------------------------------------
 
 def train_pinn_model(data_dict, save_dir,
-                     hidden_size=64, dt=0.1,
-                     lambda_phys=LAMBDA_PHYS, epsilon_w=EPSILON_W,
-                     softplus_beta=SOFTPLUS_BETA):
+                     hidden_size=64, bottleneck_size=BOTTLENECK_SIZE, dt=0.1,
+                     lambda_phys=LAMBDA_PHYS, epsilon_w=EPSILON_W):
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"lambda_phys={lambda_phys}  epsilon={epsilon_w} W  "
-          f"softplus_beta={softplus_beta}  hidden={hidden_size}  dt={dt}")
-    print(f"Physics activation: Softplus(beta={softplus_beta})  "
-          f"[beta=1=smooth, beta→∞=ReLU]")
+          f"hidden={hidden_size}  bottleneck={bottleneck_size}  dt={dt}")
 
     # ── Sequences ──
     X_tr, Y_tr = create_sequences(data_dict['train'], WIN)
@@ -330,15 +361,15 @@ def train_pinn_model(data_dict, save_dir,
         MultiApplianceDataset(X_te, Y_te), batch_size=BATCH, shuffle=False, drop_last=False)
 
     # ── Model + losses ──
-    model = PhysicsInformedBasicLiquidNetworkModel(
+    model = PhysicsInformedMTHLiquidNetworkModel(
         input_size=INPUT_SIZE, hidden_size=hidden_size,
-        n_appliances=len(APPLIANCES), dt=dt,
+        n_appliances=len(APPLIANCES),
+        bottleneck_size=bottleneck_size, dt=dt,
     ).to(device)
 
     mse_criterion  = nn.MSELoss()
     phys_criterion = PhysicsConsistencyLoss(
-        x_scalers[0], y_scalers, APPLIANCES,
-        epsilon_w=epsilon_w, beta=softplus_beta,
+        x_scalers[0], y_scalers, APPLIANCES, epsilon_w=epsilon_w
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
@@ -355,8 +386,10 @@ def train_pinn_model(data_dict, save_dir,
     counter       = 0
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params:,}")
-    print("Starting PINN-SoftplusLNN training (all appliances simultaneously)...")
+    print(f"Model parameters: {n_params:,}  "
+          f"[LNN cell + shared bottleneck({hidden_size}→{bottleneck_size}) "
+          f"+ {len(APPLIANCES)} heads]")
+    print("Starting PINN-MTH-LNN training (all appliances simultaneously)...")
 
     for epoch in range(EPOCHS):
         # ── Training ──
@@ -498,29 +531,31 @@ def train_pinn_model(data_dict, save_dir,
               f"{m['recall']:>8.4f} {m['mae']:>8.2f} {m['sae']:>8.4f}")
 
     # ── Plots ──
-    _plot_training(history, test_metrics, save_dir, softplus_beta)
+    _plot_training(history, test_metrics, save_dir, hidden_size, bottleneck_size)
 
     # ── Save JSON ──
     config = {
         'dataset':     'AMPds_enriched',
-        'model':       'PhysicsInformedBasicLiquidNetworkModel',
+        'model':       'PhysicsInformedMTHLiquidNetworkModel',
         'description': (
-            'basic LNN (fixed tau, no gate) + per-appliance heads + '
-            f'Softplus physics loss (beta={softplus_beta}), input=[P,Q]'),
-        'loss': (
-            f'MSE + {lambda_phys} * Softplus_beta{softplus_beta}'
-            f'(p_sum - P_agg - {epsilon_w}W) [stage2 only]'),
-        'physics_activation': {
-            'type':        'softplus',
-            'beta':         softplus_beta,
-            'note':         ('beta=1=smooth; beta->inf=ReLU; '
-                             'gradient=sigmoid(beta*excess), always non-zero'),
+            'BasicLNN + shared bottleneck (hidden→bottleneck→GELU→LN) '
+            '+ per-appliance projection heads + L_phys, input=[P,Q]'),
+        'loss':        (
+            f'MSE + {lambda_phys} * PhysicsConsistency(epsilon={epsilon_w}W) '
+            '[stage2 only]'),
+        'architecture': {
+            'encoder':    'BasicLNN (fixed tau, no gate)',
+            'bottleneck': f'Linear({hidden_size}→{bottleneck_size}) + GELU + LN',
+            'heads':      f'{len(APPLIANCES)} × Linear({bottleneck_size}→1)',
         },
         'input_size':  INPUT_SIZE,
         'window_size': WIN,
         'model_params': {
-            'input_size': INPUT_SIZE, 'hidden_size': hidden_size,
-            'n_appliances': len(APPLIANCES), 'dt': dt,
+            'input_size':      INPUT_SIZE,
+            'hidden_size':     hidden_size,
+            'bottleneck_size': bottleneck_size,
+            'n_appliances':    len(APPLIANCES),
+            'dt':              dt,
         },
         'train_params': {
             'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
@@ -532,7 +567,7 @@ def train_pinn_model(data_dict, save_dir,
             for app, m in test_metrics.items()
         },
     }
-    with open(os.path.join(save_dir, 'pinn_softplus_lnn_ampds_enriched_results.json'),
+    with open(os.path.join(save_dir, 'pinn_mth_lnn_ampds_enriched_results.json'),
               'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4)
 
@@ -543,7 +578,7 @@ def train_pinn_model(data_dict, save_dir,
 # Plotting
 # ---------------------------------------------------------------------------
 
-def _plot_training(history, test_metrics, save_dir, softplus_beta):
+def _plot_training(history, test_metrics, save_dir, hidden_size, bottleneck_size):
     epochs_x = range(1, len(history['train_loss']) + 1)
 
     plt.figure(figsize=(15, 4))
@@ -551,7 +586,7 @@ def _plot_training(history, test_metrics, save_dir, softplus_beta):
     plt.subplot(1, 3, 1)
     plt.plot(epochs_x, history['train_loss'], label='Train total', color='blue')
     plt.plot(epochs_x, history['val_loss'],   label='Val total',   color='red')
-    plt.title(f'Total Loss (MSE + λ·Softplus[β={softplus_beta}])')
+    plt.title(f'Total Loss  [bottleneck={bottleneck_size}]')
     plt.xlabel('Epoch'); plt.ylabel('Loss')
     plt.legend(); plt.grid(True, alpha=0.3)
 
@@ -565,19 +600,20 @@ def _plot_training(history, test_metrics, save_dir, softplus_beta):
     plt.subplot(1, 3, 3)
     plt.plot(epochs_x, history['train_phys'], label='Train Phys', color='blue')
     plt.plot(epochs_x, history['val_phys'],   label='Val Phys',   color='red')
-    plt.title(f'Physics Loss — Softplus(β={softplus_beta})')
+    plt.title('Physics Consistency Loss')
     plt.xlabel('Epoch'); plt.ylabel('L_phys')
     plt.legend(); plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'pinn_softplus_lnn_ampds_enriched_loss.png'),
+    plt.savefig(os.path.join(save_dir, 'pinn_mth_lnn_ampds_enriched_loss.png'),
                 dpi=150, bbox_inches='tight')
     plt.close()
 
     fig, axes = plt.subplots(len(APPLIANCES), 2,
                              figsize=(12, 4 * len(APPLIANCES)))
     fig.suptitle(
-        f'PINN-SoftplusLNN AMPds enriched (P+Q) β={softplus_beta} -- Per-Appliance Val Metrics',
+        f'PINN-MTH-LNN AMPds enriched (P+Q)  '
+        f'[{hidden_size}→{bottleneck_size}→heads] -- Per-Appliance Val Metrics',
         fontsize=13)
 
     for row, app in enumerate(APPLIANCES):
@@ -602,7 +638,7 @@ def _plot_training(history, test_metrics, save_dir, softplus_beta):
         ax_mae.legend(); ax_mae.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'pinn_softplus_lnn_ampds_enriched_per_appliance.png'),
+    plt.savefig(os.path.join(save_dir, 'pinn_mth_lnn_ampds_enriched_per_appliance.png'),
                 dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -619,18 +655,18 @@ if __name__ == "__main__":
             sys.exit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir  = f"models/pinn_softplus_lnn_ampds_enriched_{timestamp}"
+    save_dir  = f"models/pinn_mth_lnn_ampds_enriched_{timestamp}"
 
     data_dict = load_data()
 
     test_metrics, history = train_pinn_model(
         data_dict,
-        save_dir       = save_dir,
-        hidden_size    = 64,
-        dt             = 0.1,
-        lambda_phys    = LAMBDA_PHYS,
-        epsilon_w      = EPSILON_W,
-        softplus_beta  = SOFTPLUS_BETA,
+        save_dir        = save_dir,
+        hidden_size     = 64,
+        bottleneck_size = BOTTLENECK_SIZE,
+        dt              = 0.1,
+        lambda_phys     = LAMBDA_PHYS,
+        epsilon_w       = EPSILON_W,
     )
 
     print(f"\nResults saved to {save_dir}")
