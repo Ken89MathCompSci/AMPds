@@ -1,33 +1,23 @@
 """
-Physics-Informed Dual-Head LNN (PINN-DualHeadLNN) for NILM -- AMPds enriched splits (P+Q).
+Physics-Informed Basic LNN with Uncertainty Weighting (PINN-UW-BasicLNN)
+for NILM -- AMPds enriched splits (P + Q).
 
-Extends test_pinn_huber_lnn_ampds_enriched_splits.py by replacing each single
-output head with a pair of heads:
+Based on test_pinn_basic_lnn_ampds_enriched_splits.py.
 
-    power_head  : Linear(hidden -> 1) + ReLU   -- how much power (regression)
-    state_head  : Linear(hidden -> 1) + sigmoid -- is it ON?   (classification)
+Key change: fixed LAMBDA_PHYS is replaced with learnable uncertainty weights
+following Kendall et al. (2018) "Multi-Task Learning Using Uncertainty to
+Weigh Losses in Deep Learning".
 
-    final_pred  = state * power                 -- gated at inference only
+Loss formulation (stage 2, post-warmup):
+    s_i = log(sigma_i^2)    -- learnable log-variance per loss component
+    L_total = sum_i [ 0.5 * exp(-s_i) * L_i  +  0.5 * s_i ]
 
-Training is DECOUPLED so neither head kills the other's gradients:
-    Masked MSE trains on pred_power (ON samples only) -- power head learns E[P | ON]
-    BCE trains on pred_state vs y_bin from EPOCH 1   -- state head always supervised
-    Physics loss uses (pred_state * pred_power)       -- physically meaningful gated sum
-    Inference: final_pred = pred_state * pred_power   -- apply gating only at output time
+    where i in {mse, phys, bce}
 
-Key design choices vs prior versions:
-  - Softplus (not ReLU) for power head: no dead-neuron risk
-  - Masked MSE: power head learns conditional mean E[P|ON], not unconditional mean
-  - BCE from epoch 1: state head gets immediate supervision (not cold at epoch 21)
-  - Physics warmup: physics penalty added only after WARMUP_EPOCHS
+During warmup (epochs 1..WARMUP_EPOCHS):  only L_MSE (no weighting).
+After warmup:  uncertainty-weighted MSE + Phys + BCE.
 
-Loss:
-    Stage 1 (epochs 1-WARMUP_EPOCHS): MaskedMSE(pred_power) + weighted BCE(state)
-    Stage 2 (remaining epochs):       MaskedMSE + lambda * HuberPhys(gated) + BCE
-
-Physics constraint (Huber-style, active-power channel only):
-    violation = ReLU(sum_i p_hat_i_gated_raw - P_agg_raw - epsilon)
-    L_phys    = huber_loss(violation, 0, delta=HUBER_DELTA)
+Architecture: same BasicLNN as base script.
 """
 
 import sys
@@ -57,11 +47,9 @@ LR            = 1e-3
 BATCH         = 32
 WIN           = 100
 STRIDE        = 5
-INPUT_SIZE    = 2
+INPUT_SIZE    = 2        # main (W)  +  main_Q (VAR)
 
-LAMBDA_PHYS   = 0.01
 EPSILON_W     = 50.0
-HUBER_DELTA   = 100.0
 WARMUP_EPOCHS = 20
 
 DATA_DIR = 'data/AMPds_enriched_data'
@@ -76,13 +64,12 @@ THRESHOLDS = {
 }
 
 BCE_LAMBDA = {
-    'dish washer':  0.5,
+    'dish washer':  0.3,
     'fridge':       0.3,
-    'basement':     0.5,
-    'heat pump':    0.3,
+    'basement':     0.3,
+    'heat pump':    0.5,
 }
 
-# ON class weight -- rewards catching true positives
 BCE_ALPHA = {
     'dish washer':  1.5,
     'fridge':       1.5,
@@ -90,31 +77,58 @@ BCE_ALPHA = {
     'heat pump':    5.0,
 }
 
-# OFF class weight -- penalises false positives
-BCE_BETA = {
-    'dish washer':  2.0,
-    'fridge':       1.5,
-    'basement':     2.0,
-    'heat pump':    1.0,
-}
+
+# ---------------------------------------------------------------------------
+# Uncertainty Weighting module (Kendall et al., 2018)
+# ---------------------------------------------------------------------------
+
+class UncertaintyWeighting(nn.Module):
+    """
+    Learnable log-variance parameters for multi-task loss balancing.
+
+    For each task i:
+        weighted_loss_i = 0.5 * exp(-s_i) * L_i  +  0.5 * s_i
+        where s_i = log(sigma_i^2)  (initialised to 0 -> sigma=1)
+
+    The first term down-weights L_i as uncertainty grows; the second term
+    acts as a regulariser that prevents sigma from collapsing to infinity.
+    """
+
+    def __init__(self, n_tasks: int = 3):
+        super().__init__()
+        # log(sigma^2); initialised to 0 (sigma = 1, weight = 0.5)
+        self.log_var = nn.Parameter(torch.zeros(n_tasks))
+
+    def forward(self, *losses):
+        """
+        losses: sequence of scalar tensors, one per task.
+        Returns: total weighted loss, list of per-task precision weights.
+        """
+        assert len(losses) == self.log_var.numel(), \
+            f"Expected {self.log_var.numel()} losses, got {len(losses)}"
+        total = torch.tensor(0.0, device=self.log_var.device)
+        precisions = []
+        for i, loss_i in enumerate(losses):
+            s_i        = self.log_var[i]
+            precision  = torch.exp(-s_i)          # 1 / sigma_i^2
+            weighted   = 0.5 * precision * loss_i + 0.5 * s_i
+            total      = total + weighted
+            precisions.append(precision.item())
+        return total, precisions
 
 
 # ---------------------------------------------------------------------------
-# Physics Consistency Loss  (Huber-style, active-power channel only)
+# Physics Consistency Loss  (active-power channel only)
 # ---------------------------------------------------------------------------
 
 class PhysicsConsistencyLoss(nn.Module):
     """
-    One-sided Huber penalty:
-        violation = ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon)
-        loss      = huber_loss(violation, 0, delta=huber_delta)
+    Soft one-sided penalty:  ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon)
     """
 
-    def __init__(self, x_scaler_P, y_scalers, appliances,
-                 epsilon_w=EPSILON_W, huber_delta=HUBER_DELTA):
+    def __init__(self, x_scaler_P, y_scalers, appliances, epsilon_w=EPSILON_W):
         super().__init__()
-        self.epsilon     = epsilon_w
-        self.huber_delta = huber_delta
+        self.epsilon = epsilon_w
 
         x_min   = float(x_scaler_P.data_min_[0])
         x_range = float(x_scaler_P.data_range_[0])
@@ -131,29 +145,15 @@ class PhysicsConsistencyLoss(nn.Module):
         p_raw     = pred_scaled  * self.y_ranges + self.y_mins
         p_sum     = p_raw.sum(dim=1)
         violation = F.relu(p_sum - x_raw - self.epsilon)
-        return F.huber_loss(violation, torch.zeros_like(violation),
-                            delta=self.huber_delta)
+        return violation.mean()
 
 
 # ---------------------------------------------------------------------------
-# Dual-Head LNN Model
+# Basic LNN Model (fixed tau, no gate)
 # ---------------------------------------------------------------------------
 
-class PhysicsInformedDualHeadLiquidNetworkModel(nn.Module):
-    """
-    LTC encoder -> per-appliance dual heads (power + state).
-
-    For each appliance i:
-        power_i = ReLU( W_power_i · h )     -- magnitude (non-negative)
-        state_i = sigmoid( W_state_i · h )  -- ON probability [0, 1]
-        pred_i  = state_i * power_i          -- zeroed when OFF
-
-    Cell update (fixed tau):
-        tau   = softplus(tau_param)
-        f_t   = tanh( LayerNorm(W_in·x_t + W_rec·h) )
-        dh    = (-h / tau + f_t) * dt
-        h_new = clamp(h + dh, -10, 10)
-    """
+class PhysicsInformedBasicLiquidNetworkModel(nn.Module):
+    """Single BasicLiquidTimeLayer encoder -> per-appliance linear heads."""
 
     def __init__(self, input_size, hidden_size, n_appliances, dt=0.1):
         super().__init__()
@@ -169,23 +169,11 @@ class PhysicsInformedDualHeadLiquidNetworkModel(nn.Module):
         self.intra_norm = nn.LayerNorm(hidden_size)
         self.norm       = nn.LayerNorm(hidden_size)
 
-        # Separate heads for power magnitude and ON/OFF state
-        self.power_heads = nn.ModuleList([
-            nn.Linear(hidden_size, 1) for _ in range(n_appliances)
-        ])
-        self.state_heads = nn.ModuleList([
+        self.heads = nn.ModuleList([
             nn.Linear(hidden_size, 1) for _ in range(n_appliances)
         ])
 
     def forward(self, x):
-        """
-        x: (batch, seq_len, input_size)
-        returns:
-            power : (batch, n_apps)  raw power magnitude (no state gating)
-            state : (batch, n_apps)  ON probability [0,1], used for BCE
-        Caller is responsible for gating: final_pred = state * power at inference.
-        Training uses each head output independently to avoid gradient killing.
-        """
         batch_size, seq_len, _ = x.size()
         h   = torch.zeros(batch_size, self.hidden_size, device=x.device)
         tau = F.softplus(self.tau).unsqueeze(0)
@@ -199,11 +187,7 @@ class PhysicsInformedDualHeadLiquidNetworkModel(nn.Module):
             h          = (h + dh).clamp(-10.0, 10.0)
 
         h = self.norm(h)
-
-        # Softplus: always positive, never dead-neuron (unlike ReLU)
-        power = torch.cat([F.softplus(head(h))    for head in self.power_heads], dim=1)
-        state = torch.cat([torch.sigmoid(head(h)) for head in self.state_heads], dim=1)
-        return power, state
+        return torch.cat([head(h) for head in self.heads], dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +241,9 @@ def create_sequences(data, window_size=WIN):
 
 def _scale_X(X_tr, X_va, X_te):
     n_tr, n_va, n_te = X_tr.shape[0], X_va.shape[0], X_te.shape[0]
-    X_tr_n, X_va_n, X_te_n = X_tr.copy(), X_va.copy(), X_te.copy()
+    X_tr_n = X_tr.copy()
+    X_va_n = X_va.copy()
+    X_te_n = X_te.copy()
     scalers = []
     for ch in range(INPUT_SIZE):
         sc = MinMaxScaler()
@@ -278,8 +264,10 @@ def _scale_X(X_tr, X_va, X_te):
 def compute_per_appliance_metrics(y_true, y_pred, y_scalers):
     metrics = {}
     for i, app in enumerate(APPLIANCES):
-        raw_true = y_scalers[i].inverse_transform(y_true[:, i:i+1]).flatten()
-        raw_pred = y_scalers[i].inverse_transform(y_pred[:, i:i+1]).flatten()
+        raw_true = y_scalers[i].inverse_transform(
+            y_true[:, i:i+1]).flatten()
+        raw_pred = y_scalers[i].inverse_transform(
+            y_pred[:, i:i+1]).flatten()
         metrics[app] = calculate_nilm_metrics(
             raw_true, raw_pred, threshold=THRESHOLDS[app])
     return metrics
@@ -291,20 +279,22 @@ def compute_per_appliance_metrics(y_true, y_pred, y_scalers):
 
 def train_pinn_model(data_dict, save_dir,
                      hidden_size=64, dt=0.1,
-                     lambda_phys=LAMBDA_PHYS, epsilon_w=EPSILON_W,
-                     huber_delta=HUBER_DELTA):
+                     epsilon_w=EPSILON_W):
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"lambda_phys={lambda_phys}  epsilon={epsilon_w} W  "
-          f"huber_delta={huber_delta} W  hidden={hidden_size}  dt={dt}")
+    print(f"epsilon={epsilon_w} W  hidden={hidden_size}  dt={dt}")
+    print("Loss weighting: Kendall et al. uncertainty weighting (learnable sigma)")
 
+    # ── Sequences ──
     X_tr, Y_tr = create_sequences(data_dict['train'], WIN)
     X_va, Y_va = create_sequences(data_dict['val'],   WIN)
     X_te, Y_te = create_sequences(data_dict['test'],  WIN)
 
+    # ── Scale X per channel ──
     X_tr, X_va, X_te, x_scalers = _scale_X(X_tr, X_va, X_te)
 
+    # ── Scale Y per appliance ──
     y_scalers = []
     for i in range(len(APPLIANCES)):
         ys = MinMaxScaler()
@@ -334,35 +324,46 @@ def train_pinn_model(data_dict, save_dir,
     te_loader = torch.utils.data.DataLoader(
         MultiApplianceDataset(X_te, Y_te), batch_size=BATCH, shuffle=False, drop_last=False)
 
-    model = PhysicsInformedDualHeadLiquidNetworkModel(
+    # ── Model ──
+    model = PhysicsInformedBasicLiquidNetworkModel(
         input_size=INPUT_SIZE, hidden_size=hidden_size,
         n_appliances=len(APPLIANCES), dt=dt,
     ).to(device)
 
+    # ── Uncertainty weighting: 3 tasks (mse, phys, bce) ──
+    uw = UncertaintyWeighting(n_tasks=3).to(device)
+
+    mse_criterion  = nn.MSELoss()
     phys_criterion = PhysicsConsistencyLoss(
-        x_scalers[0], y_scalers, APPLIANCES,
-        epsilon_w=epsilon_w, huber_delta=huber_delta,
+        x_scalers[0], y_scalers, APPLIANCES, epsilon_w=epsilon_w
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    # Both model and uw parameters are optimised together
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(uw.parameters()), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=8, min_lr=1e-5)
 
     history = {
         'train_loss': [], 'train_mse': [], 'train_phys': [],
         'val_loss':   [], 'val_mse':   [], 'val_phys':   [],
+        # log_var history: shape (epochs, 3) -> [mse, phys, bce]
+        'log_var':    [],
         'val_metrics': [],
     }
     best_val_loss = float('inf')
     best_state    = None
     counter       = 0
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params:,}")
-    print("Starting PINN-DualHeadLNN training (all appliances simultaneously)...")
+    n_params = (sum(p.numel() for p in model.parameters() if p.requires_grad)
+                + sum(p.numel() for p in uw.parameters()))
+    print(f"Model parameters: {n_params:,}  (includes 3 uncertainty log-var params)")
+    print("Starting PINN-UW-BasicLNN training...")
 
     for epoch in range(EPOCHS):
+        # ── Training ──
         model.train()
+        uw.train()
         ep_mse = ep_phys = ep_total = 0.0
         progress_bar = tqdm(tr_loader,
                             desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False)
@@ -370,38 +371,30 @@ def train_pinn_model(data_dict, save_dir,
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
 
-            pred_power, pred_state = model(xb)
-            pred_gated = pred_state * pred_power   # gated output for physics + inference
+            pred = model(xb)
 
-            # Masked MSE: supervise power head only on ON samples so it learns E[P | ON]
-            on_masks   = torch.stack(
-                [(yb[:, i] > thresholds_scaled[i]) for i in range(len(APPLIANCES))],
-                dim=1
-            ).float()                                          # (batch, n_apps)
-            masked_sq  = (pred_power - yb) ** 2 * on_masks
-            n_on       = on_masks.sum(dim=0).clamp(min=1.0)   # (n_apps,)
-            mse_loss   = (masked_sq.sum(dim=0) / n_on).mean()
-
+            mse_loss  = mse_criterion(pred, yb)
             x_mid     = xb[:, WIN // 2, 0]
-            phys_loss = phys_criterion(x_mid, pred_gated)
+            phys_loss = phys_criterion(x_mid, pred)
 
-            # BCE from epoch 1 -- state head trained from the very start
-            bce_loss = torch.tensor(0.0, device=device)
-            for i, app in enumerate(APPLIANCES):
-                if BCE_LAMBDA[app] > 0:
-                    state_i = pred_state[:, i].clamp(1e-7, 1 - 1e-7)
-                    y_bin   = on_masks[:, i]
-                    w       = torch.where(y_bin == 1,
-                                          torch.full_like(y_bin, BCE_ALPHA[app]),
-                                          torch.full_like(y_bin, BCE_BETA[app]))
-                    bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
-                        state_i, y_bin, weight=w)
-
-            # Physics penalty added only after warmup
             if epoch < WARMUP_EPOCHS:
-                loss = mse_loss + bce_loss
+                # Stage 1: plain MSE (uncertainty weights not yet involved)
+                loss = mse_loss
             else:
-                loss = mse_loss + lambda_phys * phys_loss + bce_loss
+                # Stage 2: uncertainty-weighted MSE + Phys + BCE
+                bce_loss = torch.tensor(0.0, device=device)
+                for i, app in enumerate(APPLIANCES):
+                    if BCE_LAMBDA[app] > 0:
+                        pred_i = pred[:, i].clamp(1e-7, 1 - 1e-7)
+                        thr_s  = thresholds_scaled[i]
+                        y_bin  = (yb[:, i] > thr_s).float()
+                        w      = torch.where(y_bin == 1,
+                                             torch.full_like(y_bin, BCE_ALPHA[app]),
+                                             torch.ones_like(y_bin))
+                        bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
+                            pred_i, y_bin, weight=w)
+
+                loss, _ = uw(mse_loss, phys_loss, bce_loss)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -422,32 +415,45 @@ def train_pinn_model(data_dict, save_dir,
         history['train_phys'].append(avg_tr_phys)
         history['train_loss'].append(avg_tr_total)
 
+        # record current log_var values
+        lv = uw.log_var.detach().cpu().tolist()
+        history['log_var'].append(lv)
+
+        # ── Validation ──
         model.eval()
+        uw.eval()
         vl_mse = vl_phys = vl_total = 0.0
         val_preds, val_trues = [], []
 
         with torch.no_grad():
             for xb, yb in va_loader:
-                xb, yb               = xb.to(device), yb.to(device)
-                pred_power, pred_state = model(xb)
-                pred_gated           = pred_state * pred_power
+                xb, yb = xb.to(device), yb.to(device)
+                pred = model(xb)
 
-                on_masks_v  = torch.stack(
-                    [(yb[:, i] > thresholds_scaled[i]) for i in range(len(APPLIANCES))],
-                    dim=1
-                ).float()
-                masked_sq_v = (pred_power - yb) ** 2 * on_masks_v
-                n_on_v      = on_masks_v.sum(dim=0).clamp(min=1.0)
-                mse_loss    = (masked_sq_v.sum(dim=0) / n_on_v).mean()
-
+                mse_loss  = mse_criterion(pred, yb)
                 x_mid     = xb[:, WIN // 2, 0]
-                phys_loss = phys_criterion(x_mid, pred_gated)
-                loss      = mse_loss + lambda_phys * phys_loss
+                phys_loss = phys_criterion(x_mid, pred)
+                # val loss: weighted combination (or plain MSE during warmup)
+                if epoch < WARMUP_EPOCHS:
+                    val_loss = mse_loss
+                else:
+                    bce_loss = torch.tensor(0.0, device=device)
+                    for i, app in enumerate(APPLIANCES):
+                        if BCE_LAMBDA[app] > 0:
+                            pred_i = pred[:, i].clamp(1e-7, 1 - 1e-7)
+                            thr_s  = thresholds_scaled[i]
+                            y_bin  = (yb[:, i] > thr_s).float()
+                            w      = torch.where(y_bin == 1,
+                                                 torch.full_like(y_bin, BCE_ALPHA[app]),
+                                                 torch.ones_like(y_bin))
+                            bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
+                                pred_i, y_bin, weight=w)
+                    val_loss, _ = uw(mse_loss, phys_loss, bce_loss)
 
                 vl_mse   += mse_loss.item()
                 vl_phys  += phys_loss.item()
-                vl_total += loss.item()
-                val_preds.append(pred_gated.cpu().numpy())
+                vl_total += val_loss.item()
+                val_preds.append(pred.cpu().numpy())
                 val_trues.append(yb.cpu().numpy())
 
         avg_va_mse   = vl_mse   / len(va_loader)
@@ -461,7 +467,6 @@ def train_pinn_model(data_dict, save_dir,
 
         y_pred_all = np.concatenate(val_preds)
         y_true_all = np.concatenate(val_trues)
-
         per_app_metrics = compute_per_appliance_metrics(
             y_true_all, y_pred_all, y_scalers)
         history['val_metrics'].append(per_app_metrics)
@@ -469,12 +474,22 @@ def train_pinn_model(data_dict, save_dir,
         avg_f1  = np.mean([per_app_metrics[a]['f1']  for a in APPLIANCES])
         avg_mae = np.mean([per_app_metrics[a]['mae'] for a in APPLIANCES])
 
+        # Compute effective weights = exp(-log_var) for display
+        sig_mse  = np.exp(-lv[0])
+        sig_phys = np.exp(-lv[1])
+        sig_bce  = np.exp(-lv[2])
+
         print(
             f"  Epoch {epoch+1:3d}/{EPOCHS}  "
             f"train={avg_tr_total:.5f} (mse={avg_tr_mse:.5f} phys={avg_tr_phys:.5f})  "
             f"val={avg_va_total:.5f} (mse={avg_va_mse:.5f} phys={avg_va_phys:.5f})  "
             f"avgF1={avg_f1:.4f}  avgMAE={avg_mae:.2f}  "
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
+        print(
+            f"    UW precisions (1/sigma^2):  "
+            f"mse={sig_mse:.4f}  phys={sig_phys:.4f}  bce={sig_bce:.4f}  "
+            f"[log_var: {lv[0]:.3f} {lv[1]:.3f} {lv[2]:.3f}]"
         )
         for app in APPLIANCES:
             m = per_app_metrics[app]
@@ -494,6 +509,7 @@ def train_pinn_model(data_dict, save_dir,
 
     print("Training completed!")
 
+    # ── Test evaluation ──
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
@@ -501,9 +517,7 @@ def train_pinn_model(data_dict, save_dir,
     test_preds, test_trues = [], []
     with torch.no_grad():
         for xb, yb in te_loader:
-            pred_power, pred_state = model(xb.to(device))
-            pred_gated = pred_state * pred_power   # gated inference output
-            test_preds.append(pred_gated.cpu().numpy())
+            test_preds.append(model(xb.to(device)).cpu().numpy())
             test_trues.append(yb.cpu().numpy())
 
     y_pred_te = np.concatenate(test_preds)
@@ -519,16 +533,28 @@ def train_pinn_model(data_dict, save_dir,
         print(f"{app:<15} {m['f1']:>8.4f} {m['precision']:>10.4f} "
               f"{m['recall']:>8.4f} {m['mae']:>8.2f} {m['sae']:>8.4f}")
 
+    # ── Plots ──
     _plot_training(history, test_metrics, save_dir)
 
+    # ── Final learned uncertainty parameters ──
+    final_lv = uw.log_var.detach().cpu().tolist()
+    print(f"\nFinal learned log_var: mse={final_lv[0]:.4f}  "
+          f"phys={final_lv[1]:.4f}  bce={final_lv[2]:.4f}")
+    print(f"  => effective precision (1/sigma^2): "
+          f"mse={np.exp(-final_lv[0]):.4f}  "
+          f"phys={np.exp(-final_lv[1]):.4f}  "
+          f"bce={np.exp(-final_lv[2]):.4f}")
+
+    # ── Save JSON ──
     config = {
         'dataset':     'AMPds_enriched',
-        'model':       'PhysicsInformedDualHeadLiquidNetworkModel',
-        'description': ('dual-head LNN decoupled: MSE(power) + BCE(state) + Huber L_phys '
-                        '+ BCE_ALPHA/BETA, inference=state*power, input=[P,Q]'),
-        'loss':        (f'MSE(pred_power) + {lambda_phys} * HuberPhys(gated,'
-                        f'epsilon={epsilon_w}W, delta={huber_delta}W) '
-                        f'+ weighted BCE(pred_state) [stage2 only]'),
+        'model':       'PhysicsInformedBasicLiquidNetworkModel',
+        'description': (
+            'basic LNN (fixed tau, no gate) + per-appliance heads + '
+            'Kendall uncertainty-weighted losses (MSE, Phys, BCE)'),
+        'loss':        (
+            'UW: 0.5*exp(-s_i)*L_i + 0.5*s_i  for i in {mse, phys, bce} '
+            f'[warmup {WARMUP_EPOCHS} epochs: plain MSE]'),
         'input_size':  INPUT_SIZE,
         'window_size': WIN,
         'model_params': {
@@ -537,15 +563,24 @@ def train_pinn_model(data_dict, save_dir,
         },
         'train_params': {
             'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
-            'lambda_phys': lambda_phys, 'epsilon_w': epsilon_w,
-            'huber_delta': huber_delta, 'warmup_epochs': WARMUP_EPOCHS,
+            'epsilon_w': epsilon_w, 'warmup_epochs': WARMUP_EPOCHS,
+        },
+        'final_log_var': {
+            'mse':  final_lv[0],
+            'phys': final_lv[1],
+            'bce':  final_lv[2],
+        },
+        'final_precision_1_over_sigma2': {
+            'mse':  float(np.exp(-final_lv[0])),
+            'phys': float(np.exp(-final_lv[1])),
+            'bce':  float(np.exp(-final_lv[2])),
         },
         'test_metrics': {
             app: {k: float(v) for k, v in m.items()}
             for app, m in test_metrics.items()
         },
     }
-    with open(os.path.join(save_dir, 'pinn_dualhead_lnn_ampds_enriched_results.json'),
+    with open(os.path.join(save_dir, 'pinn_uw_basic_lnn_ampds_enriched_results.json'),
               'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4)
 
@@ -559,45 +594,53 @@ def train_pinn_model(data_dict, save_dir,
 def _plot_training(history, test_metrics, save_dir):
     epochs_x = range(1, len(history['train_loss']) + 1)
 
-    plt.figure(figsize=(15, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
 
-    plt.subplot(1, 3, 1)
-    plt.plot(epochs_x, history['train_loss'], label='Train total', color='blue')
-    plt.plot(epochs_x, history['val_loss'],   label='Val total',   color='red')
-    plt.title('Total Loss (MSE + lambda*HuberPhys)')
-    plt.xlabel('Epoch'); plt.ylabel('Loss')
-    plt.legend(); plt.grid(True, alpha=0.3)
+    axes[0].plot(epochs_x, history['train_loss'], label='Train total', color='blue')
+    axes[0].plot(epochs_x, history['val_loss'],   label='Val total',   color='red')
+    axes[0].set_title('Total Loss (UW)')
+    axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')
+    axes[0].legend(); axes[0].grid(True, alpha=0.3)
 
-    plt.subplot(1, 3, 2)
-    plt.plot(epochs_x, history['train_mse'], label='Train MSE', color='blue')
-    plt.plot(epochs_x, history['val_mse'],   label='Val MSE',   color='red')
-    plt.title('MSE Loss')
-    plt.xlabel('Epoch'); plt.ylabel('MSE')
-    plt.legend(); plt.grid(True, alpha=0.3)
+    axes[1].plot(epochs_x, history['train_mse'], label='Train MSE', color='blue')
+    axes[1].plot(epochs_x, history['val_mse'],   label='Val MSE',   color='red')
+    axes[1].set_title('MSE Loss')
+    axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('MSE')
+    axes[1].legend(); axes[1].grid(True, alpha=0.3)
 
-    plt.subplot(1, 3, 3)
-    plt.plot(epochs_x, history['train_phys'], label='Train Phys', color='blue')
-    plt.plot(epochs_x, history['val_phys'],   label='Val Phys',   color='red')
-    plt.title('Huber Physics Consistency Loss')
-    plt.xlabel('Epoch'); plt.ylabel('L_phys')
-    plt.legend(); plt.grid(True, alpha=0.3)
+    axes[2].plot(epochs_x, history['train_phys'], label='Train Phys', color='blue')
+    axes[2].plot(epochs_x, history['val_phys'],   label='Val Phys',   color='red')
+    axes[2].set_title('Physics Consistency Loss')
+    axes[2].set_xlabel('Epoch'); axes[2].set_ylabel('L_phys')
+    axes[2].legend(); axes[2].grid(True, alpha=0.3)
+
+    # Uncertainty log_var evolution
+    log_var_arr = np.array(history['log_var'])   # (epochs, 3)
+    axes[3].plot(epochs_x, np.exp(-log_var_arr[:, 0]), label='1/sigma^2 MSE',  color='blue')
+    axes[3].plot(epochs_x, np.exp(-log_var_arr[:, 1]), label='1/sigma^2 Phys', color='orange')
+    axes[3].plot(epochs_x, np.exp(-log_var_arr[:, 2]), label='1/sigma^2 BCE',  color='green')
+    axes[3].axvline(WARMUP_EPOCHS, color='grey', linestyle='--', alpha=0.6,
+                    label=f'Warmup end (ep {WARMUP_EPOCHS})')
+    axes[3].set_title('Learned Precisions (1/sigma^2)')
+    axes[3].set_xlabel('Epoch'); axes[3].set_ylabel('Precision weight')
+    axes[3].legend(); axes[3].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'pinn_dualhead_lnn_ampds_enriched_loss.png'),
+    plt.savefig(os.path.join(save_dir, 'pinn_uw_basic_lnn_ampds_enriched_loss.png'),
                 dpi=150, bbox_inches='tight')
     plt.close()
 
-    fig, axes = plt.subplots(len(APPLIANCES), 2,
-                             figsize=(12, 4 * len(APPLIANCES)))
-    fig.suptitle('PINN-DualHeadLNN AMPds enriched (P+Q) -- Per-Appliance Val Metrics',
+    fig, axes_grid = plt.subplots(len(APPLIANCES), 2,
+                                  figsize=(12, 4 * len(APPLIANCES)))
+    fig.suptitle('PINN-UW-BasicLNN AMPds enriched (P+Q) -- Per-Appliance Val Metrics',
                  fontsize=13)
 
     for row, app in enumerate(APPLIANCES):
         f1_series  = [m[app]['f1']  for m in history['val_metrics']]
         mae_series = [m[app]['mae'] for m in history['val_metrics']]
 
-        ax_f1  = axes[row][0]
-        ax_mae = axes[row][1]
+        ax_f1  = axes_grid[row][0]
+        ax_mae = axes_grid[row][1]
 
         ax_f1.plot(epochs_x, f1_series, color='blue', linewidth=1.5)
         ax_f1.axhline(test_metrics[app]['f1'], color='green',
@@ -614,7 +657,7 @@ def _plot_training(history, test_metrics, save_dir):
         ax_mae.legend(); ax_mae.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'pinn_dualhead_lnn_ampds_enriched_per_appliance.png'),
+    plt.savefig(os.path.join(save_dir, 'pinn_uw_basic_lnn_ampds_enriched_per_appliance.png'),
                 dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -631,7 +674,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir  = f"models/pinn_dualhead_lnn_ampds_enriched_{timestamp}"
+    save_dir  = f"models/pinn_uw_basic_lnn_ampds_enriched_{timestamp}"
 
     data_dict = load_data()
 
@@ -640,9 +683,7 @@ if __name__ == "__main__":
         save_dir    = save_dir,
         hidden_size = 64,
         dt          = 0.1,
-        lambda_phys = LAMBDA_PHYS,
         epsilon_w   = EPSILON_W,
-        huber_delta = HUBER_DELTA,
     )
 
     print(f"\nResults saved to {save_dir}")
