@@ -47,9 +47,12 @@ Architecture hyperparameter:
     Smaller → more compression / shared representation
     Larger  → closer to independent heads
 
-Loss: identical to base script.
-    Stage 1 (epochs 1-WARMUP_EPOCHS): MSE only
-    Stage 2 (remaining epochs):       MSE + lambda * L_phys + weighted BCE
+Loss:
+    Stage 1 (epochs 1-WARMUP_EPOCHS):           MSE only
+    Stage 2 (remaining epochs):                 MSE + lambda * L_phys + bce_scale * BCE
+        bce_scale ramps linearly 0→1 over BCE_RAMP_EPOCHS to prevent gradient shock.
+    Model selection resets at epoch WARMUP_EPOCHS so the saved checkpoint is
+    chosen from stage-2 (BCE-aware) training, not stage-1 (MSE-only).
 
 Physics constraint (active-power only, channel 0):
     ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon) = 0
@@ -87,6 +90,7 @@ INPUT_SIZE      = 2        # main (W)  +  main_Q (VAR)
 LAMBDA_PHYS     = 0.01
 EPSILON_W       = 50.0
 WARMUP_EPOCHS   = 20
+BCE_RAMP_EPOCHS = 10   # ramp BCE from 0→1 over this many epochs after warmup
 
 BOTTLENECK_SIZE = 32       # shared bottleneck width (hidden_size // 2 by default)
 
@@ -410,6 +414,9 @@ def train_pinn_model(data_dict, save_dir,
             if epoch < WARMUP_EPOCHS:
                 loss = mse_loss
             else:
+                # Gradually ramp BCE from 0 → 1 over BCE_RAMP_EPOCHS to
+                # prevent gradient shock at the warmup boundary.
+                bce_scale = min(1.0, (epoch - WARMUP_EPOCHS + 1) / BCE_RAMP_EPOCHS)
                 bce_loss = torch.tensor(0.0, device=device)
                 for i, app in enumerate(APPLIANCES):
                     if BCE_LAMBDA[app] > 0:
@@ -421,7 +428,7 @@ def train_pinn_model(data_dict, save_dir,
                                              torch.ones_like(y_bin))
                         bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                             pred_i, y_bin, weight=w)
-                loss = mse_loss + lambda_phys * phys_loss + bce_loss
+                loss = mse_loss + lambda_phys * phys_loss + bce_scale * bce_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -481,10 +488,15 @@ def train_pinn_model(data_dict, save_dir,
         avg_f1  = np.mean([per_app_metrics[a]['f1']  for a in APPLIANCES])
         avg_mae = np.mean([per_app_metrics[a]['mae'] for a in APPLIANCES])
 
+        bce_scale_disp = (
+            min(1.0, (epoch - WARMUP_EPOCHS + 1) / BCE_RAMP_EPOCHS)
+            if epoch >= WARMUP_EPOCHS else 0.0
+        )
         print(
             f"  Epoch {epoch+1:3d}/{EPOCHS}  "
             f"train={avg_tr_total:.5f} (mse={avg_tr_mse:.5f} phys={avg_tr_phys:.5f})  "
             f"val={avg_va_total:.5f} (mse={avg_va_mse:.5f} phys={avg_va_phys:.5f})  "
+            f"bce_scale={bce_scale_disp:.2f}  "
             f"avgF1={avg_f1:.4f}  avgMAE={avg_mae:.2f}  "
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
@@ -493,6 +505,14 @@ def train_pinn_model(data_dict, save_dir,
             print(f"    {app:<14}  F1={m['f1']:.4f}  "
                   f"P={m['precision']:.4f}  R={m['recall']:.4f}  "
                   f"MAE={m['mae']:.2f}  SAE={m['sae']:.4f}")
+
+        # Reset model selection at warmup boundary so the best model is
+        # chosen from stage-2 (BCE-aware) training, not stage-1 (MSE-only).
+        if epoch + 1 == WARMUP_EPOCHS:
+            best_val_loss = float('inf')
+            counter       = 0
+            print(f"  [Warmup end] Model selection reset — "
+                  f"stage-2 BCE-ramp training begins (ramp over {BCE_RAMP_EPOCHS} epochs).")
 
         if avg_va_mse < best_val_loss:
             best_val_loss = avg_va_mse
