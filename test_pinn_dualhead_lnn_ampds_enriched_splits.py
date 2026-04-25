@@ -65,19 +65,17 @@ DATA_DIR = 'data/AMPds_enriched_data'
 
 APPLIANCES = ['dish washer', 'fridge', 'basement', 'heat pump']
 
-# Raised to meaningful ON/OFF boundaries (not flat 10W)
 THRESHOLDS = {
-    'dish washer':  200.0,
-    'fridge':        50.0,
-    'basement':      30.0,
-    'heat pump':     50.0,
+    'dish washer':  10.0,
+    'fridge':       10.0,
+    'basement':     10.0,
+    'heat pump':    10.0,
 }
 
-# Stronger BCE signal for appliances with low precision
 BCE_LAMBDA = {
-    'dish washer':  1.5,
-    'fridge':       0.8,
-    'basement':     2.0,
+    'dish washer':  0.5,
+    'fridge':       0.3,
+    'basement':     0.5,
     'heat pump':    0.3,
 }
 
@@ -91,9 +89,9 @@ BCE_ALPHA = {
 
 # OFF class weight -- penalises false positives
 BCE_BETA = {
-    'dish washer':  3.0,
-    'fridge':       2.0,
-    'basement':     5.0,
+    'dish washer':  2.0,
+    'fridge':       1.5,
+    'basement':     2.0,
     'heat pump':    1.0,
 }
 
