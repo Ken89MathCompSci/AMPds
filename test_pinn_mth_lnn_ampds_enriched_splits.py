@@ -48,11 +48,15 @@ Architecture hyperparameter:
     Larger  → closer to independent heads
 
 Loss:
-    Stage 1 (epochs 1-WARMUP_EPOCHS):           MSE only
-    Stage 2 (remaining epochs):                 MSE + lambda * L_phys + bce_scale * BCE
-        bce_scale ramps linearly 0→1 over BCE_RAMP_EPOCHS to prevent gradient shock.
+    Stage 1 (epochs 1-WARMUP_EPOCHS):
+        MSE only
+    Stage 2 (remaining epochs):
+        MSE + LAMBDA_PHYS*L_phys + BCE_BETA*bce_scale*BCE + LAMBDA_FP*L_fp
+        bce_scale ramps linearly 0→1 over BCE_RAMP_EPOCHS (prevents gradient shock).
+        L_fp = mean over appliances of mean(pred[y==0].clamp(min=0)^2)
+             — directly penalises false-positive predictions in OFF-state windows.
     Model selection resets at epoch WARMUP_EPOCHS so the saved checkpoint is
-    chosen from stage-2 (BCE-aware) training, not stage-1 (MSE-only).
+    chosen from stage-2 (FP-aware) training, not stage-1 (MSE-only).
 
 Physics constraint (active-power only, channel 0):
     ReLU(sum_i p_hat_i_raw - P_agg_raw - epsilon) = 0
@@ -88,7 +92,8 @@ STRIDE          = 5
 INPUT_SIZE      = 2        # main (W)  +  main_Q (VAR)
 
 LAMBDA_PHYS     = 0.01
-BCE_BETA        = 0.01   # global BCE scale (analogous to LAMBDA_PHYS); keeps BCE ≈ MSE magnitude
+BCE_BETA        = 0.03   # global BCE scale; 3× stronger than before to improve F1
+LAMBDA_FP       = 0.01   # false-positive penalty scale (penalises pred>0 in OFF windows)
 EPSILON_W       = 50.0
 WARMUP_EPOCHS   = 20
 BCE_RAMP_EPOCHS = 10   # ramp BCE from 0→1 over this many epochs after warmup
@@ -320,12 +325,13 @@ def compute_per_appliance_metrics(y_true, y_pred, y_scalers):
 
 def train_pinn_model(data_dict, save_dir,
                      hidden_size=64, bottleneck_size=BOTTLENECK_SIZE, dt=0.1,
-                     lambda_phys=LAMBDA_PHYS, bce_beta=BCE_BETA, epsilon_w=EPSILON_W):
+                     lambda_phys=LAMBDA_PHYS, bce_beta=BCE_BETA, lambda_fp=LAMBDA_FP,
+                     epsilon_w=EPSILON_W):
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"lambda_phys={lambda_phys}  bce_beta={bce_beta}  epsilon={epsilon_w} W  "
-          f"hidden={hidden_size}  bottleneck={bottleneck_size}  dt={dt}")
+    print(f"lambda_phys={lambda_phys}  bce_beta={bce_beta}  lambda_fp={lambda_fp}  "
+          f"epsilon={epsilon_w} W  hidden={hidden_size}  bottleneck={bottleneck_size}  dt={dt}")
 
     # ── Sequences ──
     X_tr, Y_tr = create_sequences(data_dict['train'], WIN)
@@ -382,7 +388,7 @@ def train_pinn_model(data_dict, save_dir,
         optimizer, mode='min', factor=0.5, patience=8, min_lr=1e-5)
 
     history = {
-        'train_loss': [], 'train_mse': [], 'train_phys': [],
+        'train_loss': [], 'train_mse': [], 'train_phys': [], 'train_fp': [],
         'val_loss':   [], 'val_mse':   [], 'val_phys':   [],
         'val_metrics': [],
     }
@@ -399,7 +405,7 @@ def train_pinn_model(data_dict, save_dir,
     for epoch in range(EPOCHS):
         # ── Training ──
         model.train()
-        ep_mse = ep_phys = ep_total = 0.0
+        ep_mse = ep_phys = ep_fp = ep_total = 0.0
         progress_bar = tqdm(tr_loader,
                             desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False)
         for xb, yb in progress_bar:
@@ -429,7 +435,16 @@ def train_pinn_model(data_dict, save_dir,
                                              torch.ones_like(y_bin))
                         bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                             pred_i, y_bin, weight=w)
-                loss = mse_loss + lambda_phys * phys_loss + bce_beta * bce_scale * bce_loss
+                # False-positive penalty: penalise predicting above 0 in OFF windows
+                fp_loss = torch.tensor(0.0, device=device)
+                for i in range(len(APPLIANCES)):
+                    off_mask = yb[:, i] <= thresholds_scaled[i]
+                    if off_mask.any():
+                        fp_loss += (pred[:, i][off_mask].clamp(min=0) ** 2).mean()
+                fp_loss = fp_loss / len(APPLIANCES)
+                loss = (mse_loss + lambda_phys * phys_loss
+                        + bce_beta * bce_scale * bce_loss
+                        + lambda_fp * fp_loss)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -437,6 +452,7 @@ def train_pinn_model(data_dict, save_dir,
 
             ep_mse   += mse_loss.item()
             ep_phys  += phys_loss.item()
+            ep_fp    += fp_loss.item() if epoch >= WARMUP_EPOCHS else 0.0
             ep_total += loss.item()
             progress_bar.set_postfix({
                 'mse':  f'{mse_loss.item():.5f}',
@@ -445,9 +461,11 @@ def train_pinn_model(data_dict, save_dir,
 
         avg_tr_mse   = ep_mse   / len(tr_loader)
         avg_tr_phys  = ep_phys  / len(tr_loader)
+        avg_tr_fp    = ep_fp    / len(tr_loader)
         avg_tr_total = ep_total / len(tr_loader)
         history['train_mse'].append(avg_tr_mse)
         history['train_phys'].append(avg_tr_phys)
+        history['train_fp'].append(avg_tr_fp)
         history['train_loss'].append(avg_tr_total)
 
         # ── Validation ──
@@ -495,7 +513,8 @@ def train_pinn_model(data_dict, save_dir,
         )
         print(
             f"  Epoch {epoch+1:3d}/{EPOCHS}  "
-            f"train={avg_tr_total:.5f} (mse={avg_tr_mse:.5f} phys={avg_tr_phys:.5f})  "
+            f"train={avg_tr_total:.5f} (mse={avg_tr_mse:.5f} phys={avg_tr_phys:.5f} "
+            f"fp={avg_tr_fp:.5f})  "
             f"val={avg_va_total:.5f} (mse={avg_va_mse:.5f} phys={avg_va_phys:.5f})  "
             f"bce_scale={bce_scale_disp:.2f}  "
             f"avgF1={avg_f1:.4f}  avgMAE={avg_mae:.2f}  "
@@ -562,7 +581,7 @@ def train_pinn_model(data_dict, save_dir,
             'BasicLNN + shared bottleneck (hidden→bottleneck→GELU→LN) '
             '+ per-appliance projection heads + L_phys, input=[P,Q]'),
         'loss':        (
-            f'MSE + {lambda_phys}*L_phys + {bce_beta}*bce_scale*BCE '
+            f'MSE + {lambda_phys}*L_phys + {bce_beta}*bce_scale*BCE + {lambda_fp}*L_fp '
             f'[stage2, bce_scale ramp over {BCE_RAMP_EPOCHS} epochs, epsilon={epsilon_w}W]'),
         'architecture': {
             'encoder':    'BasicLNN (fixed tau, no gate)',
@@ -580,7 +599,7 @@ def train_pinn_model(data_dict, save_dir,
         },
         'train_params': {
             'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
-            'lambda_phys': lambda_phys, 'bce_beta': bce_beta,
+            'lambda_phys': lambda_phys, 'bce_beta': bce_beta, 'lambda_fp': lambda_fp,
             'epsilon_w': epsilon_w,
             'warmup_epochs': WARMUP_EPOCHS, 'bce_ramp_epochs': BCE_RAMP_EPOCHS,
         },
@@ -689,6 +708,7 @@ if __name__ == "__main__":
         dt              = 0.1,
         lambda_phys     = LAMBDA_PHYS,
         bce_beta        = BCE_BETA,
+        lambda_fp       = LAMBDA_FP,
         epsilon_w       = EPSILON_W,
     )
 
